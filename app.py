@@ -1,6 +1,7 @@
 import requests
 import pandas as pd
 import time
+import os
 import threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -23,9 +24,9 @@ app_state = {
 AVAILABLE_PAIRS = ["EUR_JPY", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "GBP_JPY"]
 
 OANDA_URL = "https://api-fxpractice.oanda.com"
-TELEGRAM_TOKEN = "8641583463:AAGrsLR0Xmf-fOd3FXafjC8lbqUiqCasZGM" # Fill in
-TELEGRAM_CHAT_ID = "1110417286" # Fill in
-OANDA_TOKEN = "56c3289f164a1a64b30de44241b6ec5a-4aa1d8f08ad01339e4ee2f4d6be3d7c9" # Fill in
+TELEGRAM_TOKEN = "8641583463:AAGrsLR0Xmf-fOd3FXafjC8lbqUiqCasZGM"
+TELEGRAM_CHAT_ID ="1110417286"
+OANDA_TOKEN = "56c3289f164a1a64b30de44241b6ec5a-4aa1d8f08ad01339e4ee2f4d6be3d7c9"
 
 SCAN_INTERVAL = 30
 FVG_LOOKBACK = 10
@@ -75,29 +76,75 @@ def send_telegram(message):
         return False
 
 def get_oanda_candles(granularity="M3", count=60):
+    """Fetch candles and log useful details when OANDA rejects or cannot answer."""
+    if not OANDA_TOKEN:
+        app_state["oanda_health"] = "Missing Credentials"
+        log_msg("OANDA token is missing. Set the OANDA_TOKEN environment variable.")
+        return pd.DataFrame()
+
     url = f"{OANDA_URL}/v3/instruments/{app_state['symbol']}/candles"
-    headers = {"Authorization": f"Bearer {OANDA_TOKEN}", "Accept-Datetime-Format": "RFC3339"}
+    headers = {
+        "Authorization": f"Bearer {OANDA_TOKEN}",
+        "Accept-Datetime-Format": "RFC3339",
+    }
     params = {"granularity": granularity, "count": count, "price": "M"}
+
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
+
+        payload = response.json()
         candles = []
-        for candle in response.json().get("candles", []):
+        for candle in payload.get("candles", []):
             mid = candle.get("mid")
-            if not mid: continue
+            if not mid:
+                continue
             candles.append({
                 "Time": pd.to_datetime(candle["time"], utc=True),
-                "Open": float(mid["o"]), "High": float(mid["h"]),
-                "Low": float(mid["l"]), "Close": float(mid["c"]),
-                "Complete": candle.get("complete", False)
+                "Open": float(mid["o"]),
+                "High": float(mid["h"]),
+                "Low": float(mid["l"]),
+                "Close": float(mid["c"]),
+                "Complete": candle.get("complete", False),
             })
+
         app_state["oanda_health"] = "Healthy 🟢"
-        if not candles: return pd.DataFrame()
-        df = pd.DataFrame(candles)
-        return df.set_index("Time").sort_index()
-    except Exception as e:
-        app_state["oanda_health"] = "Error 🔴"
-        log_msg(f"OANDA API error: {e}")
+        if not candles:
+            log_msg(f"OANDA returned no usable candles (granularity={granularity}, symbol={app_state['symbol']}).")
+            return pd.DataFrame()
+
+        return pd.DataFrame(candles).set_index("Time").sort_index()
+
+    except requests.HTTPError as e:
+        response = e.response
+        status_code = response.status_code if response is not None else "unknown"
+        # Limit the body length so logs remain readable; never log request headers/tokens.
+        body = response.text[:1000] if response is not None else "No response body"
+        app_state["oanda_health"] = f"HTTP Error {status_code} 🔴"
+        log_msg(
+            f"OANDA HTTP error | symbol={app_state['symbol']} | "
+            f"granularity={granularity} | status={status_code} | body={body}"
+        )
+        return pd.DataFrame()
+
+    except requests.Timeout as e:
+        app_state["oanda_health"] = "Timeout 🔴"
+        log_msg(f"OANDA timeout | symbol={app_state['symbol']} | granularity={granularity} | {e}")
+        return pd.DataFrame()
+
+    except requests.ConnectionError as e:
+        app_state["oanda_health"] = "Connection Error 🔴"
+        log_msg(f"OANDA connection error | symbol={app_state['symbol']} | granularity={granularity} | {e}")
+        return pd.DataFrame()
+
+    except requests.RequestException as e:
+        app_state["oanda_health"] = "Request Error 🔴"
+        log_msg(f"OANDA request error | symbol={app_state['symbol']} | granularity={granularity} | {e}")
+        return pd.DataFrame()
+
+    except (ValueError, KeyError, TypeError) as e:
+        app_state["oanda_health"] = "Data Error 🔴"
+        log_msg(f"OANDA response/data parsing error | granularity={granularity} | {type(e).__name__}: {e}")
         return pd.DataFrame()
 
 def get_m5_trend():
@@ -245,17 +292,19 @@ def run_fvg_scanner():
 
             candle_time = completed_3m.index[-1]
             
-            # 1. Evaluate Trend
-            app_state["scanner_status"] = "Checking M5 Trend..."
-            trend = get_m5_trend()
-            app_state["m5_trend"] = trend.upper() if trend else "Neutral"
-
-            # 2. Evaluate Indicators
+            # Evaluate the M3 crossing first. The M5 trend is only needed
+            # when a new completed-candle crossing is detected, so avoid
+            # making an M5 OANDA request on every scan.
             app_state["scanner_status"] = "Checking SMA20 Crossings..."
             crossing = detect_sma20_cross(completed_3m)
-            
+
             if crossing is not None and candle_time != last_processed_crossing:
                 last_processed_crossing = candle_time
+
+                app_state["scanner_status"] = "Checking M5 Trend for new crossing..."
+                trend = get_m5_trend()
+                app_state["m5_trend"] = trend.upper() if trend else "Neutral"
+
                 if trend == "bullish" and crossing == "below":
                     alert_type, alert_label, fvg_direction = "long", "LONG PULLBACK", "bearish"
                 elif trend == "bearish" and crossing == "above":
@@ -342,7 +391,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EUR/JPY FVG Scanner</title>
+    <title>Scanner</title>
     <style>
         :root {
             --bg-base: #0f172a;
