@@ -336,57 +336,196 @@ def run_fvg_scanner():
 
         time.sleep(SCAN_INTERVAL)
 
-# ==============================
-# FLASK WEB DASHBOARD & API
-# ==============================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Trading Alert System</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EUR/JPY FVG Scanner</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; margin: 0; padding: 20px; }
-        .container { display: flex; gap: 20px; flex-wrap: wrap; }
-        .panel { background-color: #1e1e1e; border: 1px solid #333; padding: 20px; border-radius: 8px; flex: 1; min-width: 300px; }
-        h2 { color: #ffffff; border-bottom: 1px solid #444; padding-bottom: 10px; margin-top: 0; }
-        .status-row { display: flex; justify-content: space-between; margin-bottom: 10px; border-bottom: 1px dashed #333; padding-bottom: 5px; }
-        .status-label { font-weight: bold; color: #aaa; }
-        .status-val { color: #4af626; }
-        #log-container { background-color: #000; border: 1px solid #333; padding: 10px; height: 400px; overflow-y: auto; font-family: monospace; white-space: pre-wrap; font-size: 0.9em; }
-        select, button { padding: 8px; background: #333; color: white; border: 1px solid #555; border-radius: 4px; }
-        button { cursor: pointer; background: #007bff; border: none; font-weight: bold; }
-        button:hover { background: #0056b3; }
+        :root {
+            --bg-base: #0f172a;
+            --bg-panel: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --border: #334155;
+            --log-bg: #020617;
+            --log-text: #a3e635;
+        }
+
+        * { box-sizing: border-box; }
+
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
+            background-color: var(--bg-base); 
+            color: var(--text-main); 
+            margin: 0; 
+            padding: 16px; 
+            line-height: 1.5;
+        }
+
+        .header {
+            margin-bottom: 24px;
+            text-align: center;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+
+        .container { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 20px; 
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        /* Desktop Layout */
+        @media (min-width: 992px) {
+            .container { flex-direction: row; }
+            .header { text-align: left; max-width: 1400px; margin: 0 auto 24px auto; }
+            body { padding: 32px; }
+        }
+
+        .panel { 
+            background-color: var(--bg-panel); 
+            border: 1px solid var(--border); 
+            padding: 24px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .panel-controls { flex: 1; min-width: 300px; }
+        .panel-logs { flex: 2; display: flex; flex-direction: column; }
+
+        h2 { 
+            color: var(--text-main); 
+            font-size: 1.1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid var(--border); 
+            padding-bottom: 12px; 
+            margin-top: 0; 
+            margin-bottom: 16px;
+        }
+
+        .control-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        select { 
+            flex: 1;
+            padding: 10px; 
+            background: var(--bg-base); 
+            color: var(--text-main); 
+            border: 1px solid var(--border); 
+            border-radius: 6px; 
+            font-size: 1rem;
+            outline: none;
+        }
+
+        select:focus { border-color: var(--accent); }
+
+        button { 
+            padding: 10px 16px; 
+            background: var(--accent); 
+            color: white; 
+            border: none; 
+            border-radius: 6px;
+            font-size: 0.95rem; 
+            font-weight: 600; 
+            cursor: pointer; 
+            transition: background 0.2s; 
+            flex-shrink: 0;
+        }
+
+        button:hover { background: var(--accent-hover); }
+
+        .status-row { 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center;
+            padding: 12px 0; 
+            border-bottom: 1px solid var(--border); 
+        }
+
+        .status-row:last-child { border-bottom: none; padding-bottom: 0; }
+
+        .status-label { font-weight: 500; color: var(--text-muted); }
+        .status-val { font-weight: 600; text-align: right; }
+
+        #log-container { 
+            background-color: var(--log-bg); 
+            border: 1px solid var(--border); 
+            border-radius: 8px;
+            padding: 16px; 
+            height: 60vh; 
+            min-height: 300px;
+            overflow-y: auto; 
+            font-family: 'Consolas', 'Monaco', monospace; 
+            white-space: pre-wrap; 
+            font-size: 0.85rem; 
+            color: var(--log-text);
+            flex-grow: 1;
+        }
+
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-base); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
     </style>
 </head>
 <body>
-    <h1 style="color: white; margin-bottom: 20px;">Scanner Dashboard</h1>
+    <div class="header">
+        <h1>Trading Alert Dashboard</h1>
+    </div>
     
     <div class="container">
         <!-- Control Panel -->
-        <div class="panel">
+        <div class="panel panel-controls">
             <h2>System Control</h2>
-            <div style="margin-bottom: 20px;">
-                <label class="status-label">Active Trading Pair:</label>
+            <div class="control-group">
                 <select id="symbol-select">
                     {% for pair in pairs %}
                     <option value="{{ pair }}" {% if pair == current_symbol %}selected{% endif %}>{{ pair }}</option>
                     {% endfor %}
                 </select>
-                <button onclick="updateSymbol()">Apply Change</button>
+                <button onclick="updateSymbol()">Apply</button>
             </div>
             
             <h2>Live API Health</h2>
-            <div class="status-row"><span class="status-label">OANDA Status:</span><span class="status-val" id="oanda-health">...</span></div>
-            <div class="status-row"><span class="status-label">Telegram Status:</span><span class="status-val" id="tele-health">...</span></div>
+            <div class="status-row">
+                <span class="status-label">OANDA API:</span>
+                <span class="status-val" id="oanda-health">...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">Telegram API:</span>
+                <span class="status-val" id="tele-health">...</span>
+            </div>
             
-            <h2>Scanner Activity</h2>
-            <div class="status-row"><span class="status-label">Current Task:</span><span class="status-val" id="scan-task" style="color: #ffaa00;">...</span></div>
-            <div class="status-row"><span class="status-label">M5 Trend Filter:</span><span class="status-val" id="m5-trend">...</span></div>
+            <h2 style="margin-top: 24px;">Scanner Activity</h2>
+            <div class="status-row">
+                <span class="status-label">Current Task:</span>
+                <span class="status-val" id="scan-task" style="color: #fbbf24;">...</span>
+            </div>
+            <div class="status-row">
+                <span class="status-label">M5 Trend Filter:</span>
+                <span class="status-val" id="m5-trend">...</span>
+            </div>
         </div>
 
         <!-- Logs Panel -->
-        <div class="panel" style="flex: 2;">
+        <div class="panel panel-logs">
             <h2>System Logs</h2>
             <div id="log-container">Loading logs...</div>
         </div>
@@ -395,13 +534,27 @@ HTML_TEMPLATE = """
     <script>
         function updateSymbol() {
             const newSymbol = document.getElementById("symbol-select").value;
+            const btn = document.querySelector('button');
+            const originalText = btn.innerText;
+            btn.innerText = "Applying...";
+            
             fetch('/api/settings', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ symbol: newSymbol })
             })
             .then(res => res.json())
-            .then(data => alert("Successfully switched pair to: " + data.symbol));
+            .then(data => {
+                btn.innerText = originalText;
+                // Highlight the task row briefly to show it changed
+                const taskRow = document.getElementById('scan-task');
+                taskRow.style.color = '#34d399';
+                setTimeout(() => taskRow.style.color = '#fbbf24', 2000);
+            })
+            .catch(() => {
+                btn.innerText = "Error";
+                setTimeout(() => btn.innerText = originalText, 2000);
+            });
         }
 
         function fetchData() {
@@ -414,10 +567,15 @@ HTML_TEMPLATE = """
                     document.getElementById('scan-task').innerText = data.state.scanner_status;
                     document.getElementById('m5-trend').innerText = data.state.m5_trend;
                     
+                    // Dynamic coloring for API health
+                    document.getElementById('oanda-health').style.color = data.state.oanda_health.includes('Error') ? '#ef4444' : '#34d399';
+                    document.getElementById('tele-health').style.color = data.state.telegram_health.includes('Error') ? '#ef4444' : '#34d399';
+                    
                     // Update Logs
                     const logBox = document.getElementById('log-container');
-                    const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 1;
+                    const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 5;
                     logBox.innerHTML = data.logs.join('<br>');
+                    
                     if (isScrolledToBottom) {
                         logBox.scrollTop = logBox.scrollHeight;
                     }
@@ -425,12 +583,11 @@ HTML_TEMPLATE = """
         }
         
         fetchData();
-        setInterval(fetchData, 3000); // Refresh data every 3 seconds
+        setInterval(fetchData, 3000);
     </script>
 </body>
 </html>
 """
-
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE, pairs=AVAILABLE_PAIRS, current_symbol=app_state["symbol"])
@@ -458,4 +615,4 @@ def api_settings():
 if __name__ == '__main__':
     scanner_thread = threading.Thread(target=run_fvg_scanner, daemon=True)
     scanner_thread.start()
-    app.run(host='127.0.0.1', port=8000, debug=False, use_reloader=False)
+    app.run(host='127.0.0.1', port=8001, debug=False, use_reloader=False)
