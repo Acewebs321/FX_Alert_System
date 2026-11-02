@@ -772,4 +772,4 @@ def api_settings():
 if __name__ == '__main__':
     scanner_thread = threading.Thread(target=run_fvg_scanner, daemon=True)
     scanner_thread.start()
-    app.run(host='127.0.0.1', port=8001, debug=False, use_reloader=False)
+    app.run(host='0.0.0.0', port=8001, debug=False, use_reloader=False)
