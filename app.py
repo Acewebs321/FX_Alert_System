@@ -7,6 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import deque
 from flask import Flask, jsonify, request, render_template_string
+from datetime import datetime, timedelta
 
 # ==============================
 # CONFIGURATION & GLOBAL STATE
@@ -17,8 +18,9 @@ app_state = {
     "oanda_health": "Waiting...",
     "telegram_health": "Waiting...",
     "scanner_status": "Starting up...",
-    "m5_trend": "Unknown"
-}
+    "m5_trend": "Unknown",
+    "todays_news": []
+    }
 
 # Supported pairs for the dropdown
 AVAILABLE_PAIRS = ["EUR_JPY", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "GBP_JPY"]
@@ -33,6 +35,7 @@ FVG_LOOKBACK = 10
 M3_SMA_PERIOD = 20
 M5_SMA_PERIOD = 50
 FVG_LOOKAHEAD = 10
+news_cache = {"timestamp": None, "data": []}
 
 pending_crossings = {}
 alerted_setups = set()
@@ -51,6 +54,74 @@ def log_msg(msg: str):
     formatted_msg = f"[{timestamp}] {msg}"
     print(formatted_msg, flush=True)
     system_logs.append(formatted_msg)
+
+
+
+def get_weekly_news():
+    now = time.time()
+    if news_cache["timestamp"] is None or now - news_cache["timestamp"] > 14400:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        try:
+            response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            response.raise_for_status()
+            news_cache["data"] = response.json()
+            news_cache["timestamp"] = now
+            log_msg("Economic calendar cache refreshed.")
+        except Exception as e:
+            log_msg(f"Calendar fetch error: {e}")
+    return news_cache["data"]
+
+def get_todays_pair_news(symbol, buffer_minutes=5):
+    events = get_weekly_news()
+    if not events:
+        return []
+
+    currencies = symbol.split("_")
+    uk_tz = ZoneInfo("Europe/London")
+    now_uk = datetime.now(uk_tz)
+    today_date = now_uk.date()
+
+    todays_events = []
+    for event in events:
+        country = event.get("country")
+        impact = event.get("impact")
+        
+        if country in currencies and impact in ["High", "Medium"]:
+            try:
+                event_time_utc = pd.to_datetime(event["date"], utc=True)
+                event_time_uk = event_time_utc.tz_convert(uk_tz)
+
+                if event_time_uk.date() == today_date:
+                    start_window = (event_time_uk - timedelta(minutes=buffer_minutes)).strftime("%H:%M")
+                    end_window = (event_time_uk + timedelta(minutes=buffer_minutes)).strftime("%H:%M")
+                    exact_time = event_time_uk.strftime("%H:%M")
+
+                    diff_mins = (now_uk - event_time_uk).total_seconds() / 60.0
+                    if abs(diff_mins) <= buffer_minutes:
+                        status = "ACTIVE NOW"
+                    elif diff_mins > buffer_minutes:
+                        status = "Passed"
+                    else:
+                        status = "Upcoming"
+
+                    todays_events.append({
+                        "currency": country,
+                        "title": event.get("title", "News Event"),
+                        "impact": impact,
+                        "time_uk": exact_time,
+                        "window_uk": f"{start_window} - {end_window} UK",
+                        "status": status,
+                        "sort_key": event_time_uk.strftime("%H:%M:%S")
+                    })
+            except Exception:
+                continue
+
+    todays_events.sort(key=lambda x: x["sort_key"])
+    for item in todays_events:
+        item.pop("sort_key", None)
+    return todays_events
+
+
 
 # ==============================
 # EXISTING SCANNER LOGIC WITH HEALTH CHECKS
@@ -572,6 +643,11 @@ HTML_TEMPLATE = """
                 <span class="status-val" id="m5-trend">...</span>
             </div>
         </div>
+        
+
+            <!-- ADD THIS BLOCK -->
+            <h2 style="margin-top: 24px;">Today's Pair News (UK Time)</h2>
+            <div id="news-container">Checking calendar...</div>
 
         <!-- Logs Panel -->
         <div class="panel panel-logs">
@@ -606,6 +682,35 @@ HTML_TEMPLATE = """
             });
         }
 
+
+        // ADD THIS FUNCTION ABOVE fetchData()
+        function renderNews(newsList, symbol) {
+            const container = document.getElementById('news-container');
+            if (!newsList || newsList.length === 0) {
+                container.innerHTML = `<div style="color: #34d399; font-size: 0.9rem;">🟢 No High/Medium news today for ${symbol}</div>`;
+                return;
+            }
+
+            container.innerHTML = newsList.map(item => {
+                const badgeColor = item.impact === 'High' ? '#ef4444' : '#f59e0b';
+                const statusColor = item.status === 'ACTIVE NOW' ? '#ef4444' : (item.status === 'Passed' ? '#64748b' : '#fbbf24');
+                return `
+                    <div style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px; margin-bottom: 8px; font-size: 0.85rem;">
+                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                            <span style="color: ${badgeColor}; font-weight: 700;">${item.currency} • ${item.impact.toUpperCase()}</span>
+                            <span style="font-weight: 700; color: ${statusColor};">${item.status}</span>
+                        </div>
+                        <div style="font-weight: 600; margin-bottom: 4px;">${item.title}</div>
+                        <div style="color: #94a3b8; display: flex; justify-content: space-between;">
+                            <span>Time: <strong>${item.time_uk}</strong></span>
+                            <span>Avoid (±5m): <strong>${item.window_uk}</strong></span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        }
+
+
         function fetchData() {
             fetch('/api/data')
                 .then(res => res.json())
@@ -615,6 +720,7 @@ HTML_TEMPLATE = """
                     document.getElementById('tele-health').innerText = data.state.telegram_health;
                     document.getElementById('scan-task').innerText = data.state.scanner_status;
                     document.getElementById('m5-trend').innerText = data.state.m5_trend;
+                    renderNews(data.state.todays_news, data.state.symbol);
                     
                     // Dynamic coloring for API health
                     document.getElementById('oanda-health').style.color = data.state.oanda_health.includes('Error') ? '#ef4444' : '#34d399';
@@ -643,10 +749,12 @@ def index():
 
 @app.route('/api/data')
 def api_data():
+    app_state["todays_news"] = get_todays_pair_news(app_state["symbol"], buffer_minutes=5)
     return jsonify({
         "state": app_state,
         "logs": list(system_logs)
     })
+
 
 @app.route('/api/settings', methods=['POST'])
 def api_settings():
