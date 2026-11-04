@@ -417,6 +417,29 @@ def run_fvg_scanner():
                 if fvg is None:
                     continue
 
+                # ==========================================
+                # NEW FILTER: CHECK IF FVG IS ALREADY VISITED
+                # ==========================================
+                # Get all completed candles that formed AFTER the FVG's third candle
+                post_fvg_candles = completed_3m.loc[completed_3m.index > fvg["time"]]
+                is_mitigated = False
+                
+                if not post_fvg_candles.empty:
+                    if fvg["type"] == "Bearish FVG":
+                        # Visited if any subsequent candle's High reaches up into the gap's bottom
+                        if (post_fvg_candles["High"] >= fvg["bottom"]).any():
+                            is_mitigated = True
+                    elif fvg["type"] == "Bullish FVG":
+                        # Visited if any subsequent candle's Low reaches down into the gap's top
+                        if (post_fvg_candles["Low"] <= fvg["top"]).any():
+                            is_mitigated = True
+
+                if is_mitigated:
+                    log_msg(f"Discarding setup: {fvg['type']} at {fvg['time'].strftime('%H:%M')} already visited.")
+                    pending_crossings.pop(key, None)
+                    continue
+                # ==========================================
+
                 # Only log after a qualifying FVG has been found.
                 log_msg(
                     f"FVG confirmed at {fvg['time']} UTC | "
