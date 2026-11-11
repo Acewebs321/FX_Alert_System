@@ -4,9 +4,15 @@ on:
   push:
     branches: [ main, master ]
 
+# Automatically cancel any older push that is still running or queued
+concurrency:
+  group: gcp-vm-deploy
+  cancel-in-progress: true
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 5  # Hard safety timeout so a job can never hang for 20+ mins
 
     steps:
       - name: Checkout repository code
@@ -28,35 +34,33 @@ jobs:
 
       - name: Restart the Scanner App
         run: |
-          ssh ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }} << 'EOF'
+          ssh -o ServerAliveInterval=15 ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }} << 'EOF'
             set -e
             cd ~/fx_scanner
 
-            # Create virtual environment if missing
             if [ ! -d "venv" ]; then
               python3 -m venv venv
             fi
 
-            # Install all required packages directly into venv (no requirements.txt needed)
             ./venv/bin/pip install --upgrade pip --quiet
             ./venv/bin/pip install requests pandas numpy flask joblib scikit-learn xgboost --quiet
 
-            # Stop old tmux session and any stuck process on port 8001
-            tmux kill-session -t scanner || true
-            pkill -f "app.py" || true
+            # Stop old tmux session and any process on port 8001
+            tmux kill-session -t scanner 2>/dev/null || true
+            pkill -f "app.py" 2>/dev/null || true
             sleep 1
 
-            # Start app.py using the explicit venv python path and log output
-            tmux new-session -d -s scanner "cd ~/fx_scanner && ./venv/bin/python3 app.py > scanner.log 2>&1"
+            # CRITICAL: Redirect stdin/stdout/stderr on tmux itself so SSH does not hang!
+            tmux new-session -d -s scanner "cd ~/fx_scanner && ./venv/bin/python3 app.py > scanner.log 2>&1" < /dev/null > /dev/null 2>&1
 
-            # Wait 3 seconds and verify app.py is alive
             sleep 3
             if pgrep -f "app.py" > /dev/null; then
               echo "✅ Scanner deployed and running!"
-              tail -n 20 scanner.log
+              tail -n 15 scanner.log
             else
               echo "❌ app.py crashed on startup! Error log:"
               cat scanner.log
               exit 1
             fi
+            exit 0
           EOF
