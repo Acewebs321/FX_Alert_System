@@ -26,25 +26,38 @@ app_state = {
     "todays_news": []
 }
 
-# Locked exclusively to EUR_JPY as requested
-AVAILABLE_PAIRS = ["EUR_JPY", "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CHF", "GBP_JPY"]
+
 
 OANDA_URL = "https://api-fxpractice.oanda.com"
 TELEGRAM_TOKEN = "8641583463:AAGrsLR0Xmf-fOd3FXafjC8lbqUiqCasZGM"
 TELEGRAM_CHAT_ID ="1110417286"
 OANDA_TOKEN = "56c3289f164a1a64b30de44241b6ec5a-4aa1d8f08ad01339e4ee2f4d6be3d7c9"
+# Supports both EUR_JPY and GBP_JPY with dedicated pair-specific ML models/thresholds
+AVAILABLE_PAIRS = ["EUR_JPY", "GBP_JPY"]
+
+
 
 SCAN_INTERVAL = 30
 FVG_LOOKBACK = 10
 M3_SMA_PERIOD = 20
 M5_SMA_PERIOD = 50
 FVG_LOOKAHEAD = 10
-MODEL_PATH = "fvg_revisit_model.joblib"
+
+MODEL_PATHS = {
+    "EUR_JPY": ["fvg_revisit_model_EUR_JPY.joblib", "fvg_revisit_model.joblib"],
+    "GBP_JPY": ["fvg_revisit_model_GBP_JPY.joblib"]
+}
+
+# Pair-specific default gap quantiles (GBP_JPY has ~1.25x wider average M3 range than EUR_JPY)
+PAIR_DEFAULTS = {
+    "EUR_JPY": {"q25_gap": 0.006, "q50_gap": 0.012, "q75_gap": 0.024},
+    "GBP_JPY": {"q25_gap": 0.008, "q50_gap": 0.015, "q75_gap": 0.030}
+}
 
 news_cache = {"timestamp": None, "data": []}
 pending_crossings = {}
 alerted_setups = set()
-ml_bundle = None
+ml_bundles = {"EUR_JPY": None, "GBP_JPY": None}
 
 # Dashboard Log Storage
 MAX_LOGS = 100
@@ -64,31 +77,43 @@ def log_msg(msg: str):
 # ==============================
 # ML MODEL LOADER & PREDICTOR
 # ==============================
-def load_ml_model():
-    global ml_bundle
-    if os.path.exists(MODEL_PATH):
-        try:
-            ml_bundle = joblib.load(MODEL_PATH)
-            app_state["ml_status"] = "Loaded (EUR_JPY) 🟢"
-            log_msg(f"ML model loaded successfully from {MODEL_PATH}.")
-        except Exception as e:
-            ml_bundle = None
-            app_state["ml_status"] = "Load Error (Rule Fallback) 🟡"
-            log_msg(f"Failed to load ML model ({e}); using statistical rule fallback.")
-    else:
-        ml_bundle = None
-        app_state["ml_status"] = "Stats Fallback Mode 🟡"
-        log_msg(f"{MODEL_PATH} not found; using EUR_JPY 1,817-row statistical lookup fallback.")
+def load_ml_models():
+    loaded_pairs = []
+    for pair, candidate_files in MODEL_PATHS.items():
+        ml_bundles[pair] = None
+        for path in candidate_files:
+            if os.path.exists(path):
+                try:
+                    ml_bundles[pair] = joblib.load(path)
+                    loaded_pairs.append(f"{pair} ({path})")
+                    log_msg(f"Loaded ML model for {pair} from {path}.")
+                    break
+                except Exception as e:
+                    log_msg(f"Error loading {path} for {pair}: {e}")
+    update_ml_status_badge()
 
-def evaluate_eurjpy_ml_setup(setup, fvg, completed_3m, alert_close_time):
+def update_ml_status_badge():
+    active_pair = app_state["symbol"]
+    if ml_bundles.get(active_pair) is not None:
+        app_state["ml_status"] = f"Loaded ({active_pair}) 🟢"
+    else:
+        app_state["ml_status"] = f"Stats Fallback ({active_pair}) 🟡"
+
+def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
     """
-    Computes the exact 16 features used in training for EUR_JPY and returns:
-    (revisit_prob, confidence_tier_label, is_recommended, feature_summary_dict)
+    Computes the 16 features for the active pair (EUR_JPY or GBP_JPY) using
+    pair-specific gap quantiles and returns:
+    (est_revisit_prob, raw_score, confidence_tier_label, feature_summary_dict)
     """
     crossing_time = setup["time"]
     fvg_time = fvg["time"]
+    bundle = ml_bundles.get(symbol)
+    defaults = PAIR_DEFAULTS.get(symbol, PAIR_DEFAULTS["EUR_JPY"])
 
-    # Calculate SMAs on completed_3m (60 candles is >= 50 needed for SMA50)
+    q25_gap = bundle.get("q25_gap", defaults["q25_gap"]) if bundle else defaults["q25_gap"]
+    q50_gap = bundle.get("q50_gap", defaults["q50_gap"]) if bundle else defaults["q50_gap"]
+    q75_gap = bundle.get("q75_gap", defaults["q75_gap"]) if bundle else defaults["q75_gap"]
+
     df_calc = completed_3m.copy()
     df_calc["SMA20"] = df_calc["Close"].rolling(M3_SMA_PERIOD).mean()
     df_calc["SMA50"] = df_calc["Close"].rolling(M5_SMA_PERIOD).mean()
@@ -97,7 +122,6 @@ def evaluate_eurjpy_ml_setup(setup, fvg, completed_3m, alert_close_time):
     sma_3m_20 = float(current["SMA20"])
     sma_3m_50 = float(current["SMA50"]) if pd.notna(current["SMA50"]) else sma_3m_20
 
-    # Use M5 SMA50 stored at crossing or fetch latest M5 SMA50
     sma_5m_50 = setup.get("m5_sma50")
     if sma_5m_50 is None or pd.isna(sma_5m_50):
         _, sma_5m_50 = get_m5_trend_and_sma()
@@ -116,8 +140,8 @@ def evaluate_eurjpy_ml_setup(setup, fvg, completed_3m, alert_close_time):
     is_peak_wait_9_or_18 = int(round(wait_after_cross_mins, 1) in [9.0, 18.0])
     is_late_wait_27_30 = int(round(wait_after_cross_mins, 1) in [27.0, 30.0])
 
-    is_optimal_gap = int((gap_size > 0.006) and (gap_size <= 0.012))
-    is_exhaustion_gap = int(gap_size > 0.024)
+    is_optimal_gap = int((gap_size > q25_gap) and (gap_size <= q50_gap))
+    is_exhaustion_gap = int(gap_size > q75_gap)
 
     hour = alert_close_time.hour
     is_ny_overlap = int(13 <= hour <= 16)
@@ -147,37 +171,37 @@ def evaluate_eurjpy_ml_setup(setup, fvg, completed_3m, alert_close_time):
         "Trend_Bullish": trend_bullish
     }
 
-    # If the trained joblib model is present, use the exact XGBoost + Random Forest ensemble
-    if ml_bundle is not None:
+    if bundle is not None:
         try:
-            feature_cols = ml_bundle["features"]
+            feature_cols = bundle["features"]
             X_live = pd.DataFrame([row_dict])[feature_cols]
-            xgb_prob = float(ml_bundle["xgb"].predict_proba(X_live)[0, 1])
-            rf_prob = float(ml_bundle["rf"].predict_proba(X_live)[0, 1])
+            xgb_prob = float(bundle["xgb"].predict_proba(X_live)[0, 1])
+            rf_prob = float(bundle["rf"].predict_proba(X_live)[0, 1])
             raw_score = 0.55 * xgb_prob + 0.45 * rf_prob
 
-            p30 = ml_bundle.get("p30_cutoff", 0.45)
-            p50 = ml_bundle.get("p50_cutoff", 0.50)
-            p70 = ml_bundle.get("p70_cutoff", 0.55)
+            p30 = bundle.get("p30_cutoff", 0.45)
+            p50 = bundle.get("p50_cutoff", 0.50)
+            p70 = bundle.get("p70_cutoff", 0.55)
+            tier_wrs = bundle.get("tier_winrates", {})
 
             if raw_score >= p70:
                 tier = "🔥 HIGH CONVICTION (Top 30%)"
-                est_wr = 0.848
+                est_wr = tier_wrs.get("top30", 0.848)
             elif raw_score >= p50:
                 tier = "✅ STRONG SETUP (Top 50%)"
-                est_wr = 0.817
+                est_wr = tier_wrs.get("top50", 0.817)
             elif raw_score >= p30:
                 tier = "🟡 MODERATE SETUP (Top 70%)"
-                est_wr = 0.801
+                est_wr = tier_wrs.get("top70", 0.801)
             else:
                 tier = "⚠️ LOW PROBABILITY (Bottom 30%)"
-                est_wr = 0.705
+                est_wr = tier_wrs.get("bottom30", 0.705)
 
-            return est_wr, raw_score, tier, row_dict
+            return float(est_wr), raw_score, tier, row_dict
         except Exception as e:
-            log_msg(f"ML prediction error, using empirical lookup: {e}")
+            log_msg(f"ML prediction error for {symbol}, using empirical lookup: {e}")
 
-    # Empirical lookup fallback based directly on the 1,817-row EUR_JPY diagnostic table
+    # Empirical fallback calibrated to JPY cross timing regimes
     wait_Empirical_Map = {
         3.0: 0.705, 6.0: 0.805, 9.0: 0.861, 12.0: 0.750,
         15.0: 0.832, 18.0: 0.860, 21.0: 0.804, 24.0: 0.826,
@@ -235,7 +259,7 @@ def get_todays_pair_news(symbol, buffer_minutes=5):
     for event in events:
         country = event.get("country")
         impact = event.get("impact")
-        
+
         if country in currencies and impact in ["High", "Medium"]:
             try:
                 event_time_utc = pd.to_datetime(event["date"], utc=True)
@@ -296,14 +320,13 @@ def send_telegram(message):
         return False
 
 def get_oanda_candles(granularity="M3", count=60):
-    """Fetch candles and log useful details when OANDA rejects or cannot answer."""
     if not OANDA_TOKEN:
         app_state["oanda_health"] = "Missing Credentials"
         log_msg("OANDA token is missing. Set the OANDA_TOKEN variable.")
         return pd.DataFrame()
 
-    # Locked to EUR_JPY
-    url = f"{OANDA_URL}/v3/instruments/EUR_JPY/candles"
+    active_symbol = app_state["symbol"]
+    url = f"{OANDA_URL}/v3/instruments/{active_symbol}/candles"
     headers = {
         "Authorization": f"Bearer {OANDA_TOKEN}",
         "Accept-Datetime-Format": "RFC3339",
@@ -331,7 +354,7 @@ def get_oanda_candles(granularity="M3", count=60):
 
         app_state["oanda_health"] = "Healthy 🟢"
         if not candles:
-            log_msg(f"OANDA returned no usable candles (granularity={granularity}, symbol=EUR_JPY).")
+            log_msg(f"OANDA returned no usable candles (granularity={granularity}, symbol={active_symbol}).")
             return pd.DataFrame()
 
         return pd.DataFrame(candles).set_index("Time").sort_index()
@@ -341,22 +364,22 @@ def get_oanda_candles(granularity="M3", count=60):
         status_code = response.status_code if response is not None else "unknown"
         body = response.text[:1000] if response is not None else "No response body"
         app_state["oanda_health"] = f"HTTP Error {status_code} 🔴"
-        log_msg(f"OANDA HTTP error | symbol=EUR_JPY | granularity={granularity} | status={status_code} | body={body}")
+        log_msg(f"OANDA HTTP error | symbol={active_symbol} | granularity={granularity} | status={status_code} | body={body}")
         return pd.DataFrame()
 
     except requests.Timeout as e:
         app_state["oanda_health"] = "Timeout 🔴"
-        log_msg(f"OANDA timeout | symbol=EUR_JPY | granularity={granularity} | {e}")
+        log_msg(f"OANDA timeout | symbol={active_symbol} | granularity={granularity} | {e}")
         return pd.DataFrame()
 
     except requests.ConnectionError as e:
         app_state["oanda_health"] = "Connection Error 🔴"
-        log_msg(f"OANDA connection error | symbol=EUR_JPY | granularity={granularity} | {e}")
+        log_msg(f"OANDA connection error | symbol={active_symbol} | granularity={granularity} | {e}")
         return pd.DataFrame()
 
     except requests.RequestException as e:
         app_state["oanda_health"] = "Request Error 🔴"
-        log_msg(f"OANDA request error | symbol=EUR_JPY | granularity={granularity} | {e}")
+        log_msg(f"OANDA request error | symbol={active_symbol} | granularity={granularity} | {e}")
         return pd.DataFrame()
 
     except (ValueError, KeyError, TypeError) as e:
@@ -405,9 +428,6 @@ def find_matching_fvg(
         return None
 
     crossing_pos = df.index.get_loc(crossing_time)
-
-    # Candidate FVGs are identified by the index of their
-    # third candle, which confirms the FVG when it closes.
     first_i = max(2, crossing_pos - lookback)
     last_i = min(len(df) - 1, crossing_pos + lookahead)
 
@@ -475,19 +495,20 @@ def is_trading_time():
     return 7 <= uk_time.hour < 20
 
 def run_fvg_scanner():
-    load_ml_model()
+    load_ml_models()
     last_processed_crossing = None
 
     while True:
         try:
-            app_state["symbol"] = "EUR_JPY"
+            active_symbol = app_state["symbol"]
+            update_ml_status_badge()
 
             if not is_trading_time():
                 app_state["scanner_status"] = "Paused (Outside UK Trading Hours)"
                 time.sleep(SCAN_INTERVAL)
                 continue
 
-            app_state["scanner_status"] = "Fetching M3 Candles for EUR_JPY..."
+            app_state["scanner_status"] = f"Fetching M3 Candles for {active_symbol}..."
             df_3m = get_oanda_candles("M3", count=60)
             if df_3m.empty:
                 app_state["scanner_status"] = "Waiting for OANDA Data..."
@@ -505,8 +526,8 @@ def run_fvg_scanner():
             app_state["scanner_status"] = "Checking SMA20 Crossings..."
             crossing = detect_sma20_cross(completed_3m)
 
-            if crossing is not None and candle_time != last_processed_crossing:
-                last_processed_crossing = candle_time
+            if crossing is not None and (active_symbol, candle_time) != last_processed_crossing:
+                last_processed_crossing = (active_symbol, candle_time)
 
                 app_state["scanner_status"] = "Checking M5 Trend for new crossing..."
                 trend, m5_sma50_val = get_m5_trend_and_sma()
@@ -521,6 +542,7 @@ def run_fvg_scanner():
 
                 if alert_type:
                     pending_crossings[str(candle_time)] = {
+                        "symbol": active_symbol,
                         "time": candle_time,
                         "crossing": crossing,
                         "trend": trend,
@@ -530,14 +552,17 @@ def run_fvg_scanner():
                         "fvg_direction": fvg_direction,
                         "price": float(completed_3m.iloc[-1]["Close"])
                     }
-                    log_msg(f"New Crossing: {crossing.upper()} | Trend: {trend} | Need {fvg_direction} FVG.")
+                    log_msg(f"[{active_symbol}] New Crossing: {crossing.upper()} | Trend: {trend} | Need {fvg_direction} FVG.")
 
-            # 3. Process Pending Crossings
+            # Process Pending Crossings
             app_state["scanner_status"] = f"Processing {len(pending_crossings)} pending setups..."
             for key in list(pending_crossings.keys()):
                 setup = pending_crossings[key]
-                crossing_time = setup["time"]
+                if setup.get("symbol") != active_symbol:
+                    pending_crossings.pop(key, None)
+                    continue
 
+                crossing_time = setup["time"]
                 if crossing_time not in completed_3m.index:
                     pending_crossings.pop(key, None)
                     continue
@@ -573,38 +598,36 @@ def run_fvg_scanner():
                             is_mitigated = True
 
                 if is_mitigated:
-                    log_msg(f"Discarding setup: {fvg['type']} at {fvg['time'].strftime('%H:%M')} already visited.")
+                    log_msg(f"[{active_symbol}] Discarding setup: {fvg['type']} at {fvg['time'].strftime('%H:%M')} already visited.")
                     pending_crossings.pop(key, None)
                     continue
                 # ==========================================
 
-                setup_key = (setup["alert_type"], str(crossing_time), str(fvg["time"]))
+                setup_key = (active_symbol, setup["alert_type"], str(crossing_time), str(fvg["time"]))
                 if setup_key in alerted_setups:
                     pending_crossings.pop(key, None)
                     continue
 
-                # Evaluate ML Revisit Probability & Features at the close of the detection M3 candle
                 alert_close_time = candle_time + timedelta(minutes=3)
-                est_revisit_prob, ml_raw_score, confidence_tier, feat_info = evaluate_eurjpy_ml_setup(
-                    setup, fvg, completed_3m, alert_close_time
+                est_revisit_prob, ml_raw_score, confidence_tier, feat_info = evaluate_pair_ml_setup(
+                    active_symbol, setup, fvg, completed_3m, alert_close_time
                 )
 
                 wait_mins = feat_info["Wait_After_Cross_Mins"]
                 gap_size = feat_info["FVG GAP"]
-                regime_label = "Post-Cross FVG (81.1% Base)" if wait_mins > 3.0 else "Pre-Cross FVG (70.5% Base)"
+                regime_label = "Post-Cross FVG" if wait_mins > 3.0 else "Pre-Cross FVG"
 
                 log_msg(
-                    f"FVG confirmed at {fvg['time']} UTC | Crossing at {crossing_time} UTC | "
+                    f"[{active_symbol}] FVG confirmed at {fvg['time']} UTC | Crossing at {crossing_time} UTC | "
                     f"ML Prob: {est_revisit_prob:.1%} ({confidence_tier})"
                 )
 
                 fvg_uk = fvg["time"].tz_convert("Europe/London")
-                crossing_uk = crossing_time.tz_convert("Europe/London")
                 detected_uk = pd.Timestamp.now(tz="Europe/London")
                 delay_seconds = (detected_uk - fvg_uk).total_seconds()
 
                 message = (
-                    f"🚨 EUR_JPY - {setup['alert_label']}\n\n"
+                    f"🚨 {active_symbol} - {setup['alert_label']}\n\n"
                     f"• ML 60m Revisit Est: {est_revisit_prob:.1%}\n"
                     f"• Signal Tier: {confidence_tier}\n"
                     f"• Setup Regime: {regime_label}\n"
@@ -619,7 +642,7 @@ def run_fvg_scanner():
                 if send_telegram(message):
                     alerted_setups.add(setup_key)
                     pending_crossings.pop(key, None)
-                    log_msg("Telegram alert sent successfully.")
+                    log_msg(f"[{active_symbol}] Telegram alert sent successfully.")
 
             app_state["scanner_status"] = "Idle (Waiting for next scan interval)"
 
@@ -635,7 +658,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EUR_JPY ML FVG Scanner</title>
+    <title>EUR_JPY & GBP_JPY ML Scanner</title>
     <style>
         :root {
             --bg-base: #0f172a;
@@ -707,17 +730,40 @@ HTML_TEMPLATE = """
             margin-bottom: 16px;
         }
 
-        .pair-badge {
+        .control-group {
             display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 12px 16px;
-            background: var(--bg-base);
-            border: 1px solid var(--accent);
-            border-radius: 8px;
+            gap: 10px;
             margin-bottom: 24px;
-            font-weight: 700;
+            flex-wrap: wrap;
         }
+
+        select { 
+            flex: 1;
+            padding: 10px; 
+            background: var(--bg-base); 
+            color: var(--text-main); 
+            border: 1px solid var(--border); 
+            border-radius: 6px; 
+            font-size: 1rem;
+            outline: none;
+        }
+
+        select:focus { border-color: var(--accent); }
+
+        button { 
+            padding: 10px 16px; 
+            background: var(--accent); 
+            color: white; 
+            border: none; 
+            border-radius: 6px;
+            font-size: 0.95rem; 
+            font-weight: 600; 
+            cursor: pointer; 
+            transition: background 0.2s; 
+            flex-shrink: 0;
+        }
+
+        button:hover { background: var(--accent-hover); }
 
         .status-row { 
             display: flex; 
@@ -755,16 +801,19 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="header">
-        <h1>EUR_JPY Trading Alert Dashboard (ML Enabled)</h1>
+        <h1>JPY Crosses Trading Alert Dashboard (EUR_JPY & GBP_JPY ML)</h1>
     </div>
     
     <div class="container">
-        <!-- Control Panel -->
         <div class="panel panel-controls">
-            <h2>Active Instrument</h2>
-            <div class="pair-badge">
-                <span>Locked Pair:</span>
-                <span style="color: #60a5fa;">EUR_JPY (ML Calibrated)</span>
+            <h2>System Control (EUR_JPY / GBP_JPY)</h2>
+            <div class="control-group">
+                <select id="symbol-select">
+                    {% for pair in pairs %}
+                    <option value="{{ pair }}" {% if pair == current_symbol %}selected{% endif %}>{{ pair }}</option>
+                    {% endfor %}
+                </select>
+                <button onclick="updateSymbol()">Apply</button>
             </div>
             
             <h2>Live API & ML Health</h2>
@@ -791,11 +840,10 @@ HTML_TEMPLATE = """
                 <span class="status-val" id="m5-trend">...</span>
             </div>
 
-            <h2 style="margin-top: 24px;">Today's EUR/JPY News (UK Time)</h2>
+            <h2 style="margin-top: 24px;">Today's Pair News (UK Time)</h2>
             <div id="news-container">Checking calendar...</div>
         </div>
 
-        <!-- Logs Panel -->
         <div class="panel panel-logs">
             <h2>System Logs</h2>
             <div id="log-container">Loading logs...</div>
@@ -803,6 +851,31 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        function updateSymbol() {
+            const newSymbol = document.getElementById("symbol-select").value;
+            const btn = document.querySelector('button');
+            const originalText = btn.innerText;
+            btn.innerText = "Applying...";
+            
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ symbol: newSymbol })
+            })
+            .then(res => res.json())
+            .then(data => {
+                btn.innerText = originalText;
+                const taskRow = document.getElementById('scan-task');
+                taskRow.style.color = '#34d399';
+                setTimeout(() => taskRow.style.color = '#fbbf24', 2000);
+                fetchData();
+            })
+            .catch(() => {
+                btn.innerText = "Error";
+                setTimeout(() => btn.innerText = originalText, 2000);
+            });
+        }
+
         function renderNews(newsList, symbol) {
             const container = document.getElementById('news-container');
             if (!newsList || newsList.length === 0) {
@@ -863,11 +936,11 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, pairs=AVAILABLE_PAIRS, current_symbol="EUR_JPY")
+    return render_template_string(HTML_TEMPLATE, pairs=AVAILABLE_PAIRS, current_symbol=app_state["symbol"])
 
 @app.route('/api/data')
 def api_data():
-    app_state["todays_news"] = get_todays_pair_news("EUR_JPY", buffer_minutes=5)
+    app_state["todays_news"] = get_todays_pair_news(app_state["symbol"], buffer_minutes=5)
     return jsonify({
         "state": app_state,
         "logs": list(system_logs)
@@ -875,9 +948,16 @@ def api_data():
 
 @app.route('/api/settings', methods=['POST'])
 def api_settings():
-    # Locked exclusively to EUR_JPY so the EUR_JPY ML model is never applied to another pair
-    app_state["symbol"] = "EUR_JPY"
-    return jsonify({"status": "success", "symbol": "EUR_JPY"})
+    data = request.json
+    new_symbol = data.get("symbol")
+    if new_symbol and new_symbol in AVAILABLE_PAIRS:
+        app_state["symbol"] = new_symbol
+        pending_crossings.clear()
+        alerted_setups.clear()
+        update_ml_status_badge()
+        log_msg(f"=== SYSTEM SWITCHED PAIR TO {new_symbol} ===")
+        return jsonify({"status": "success", "symbol": new_symbol})
+    return jsonify({"status": "error", "message": "Invalid symbol. Only EUR_JPY and GBP_JPY are enabled."}), 400
 
 if __name__ == '__main__':
     scanner_thread = threading.Thread(target=run_fvg_scanner, daemon=True)
