@@ -1,0 +1,43 @@
+name: Live Auto-Deploy to GCP
+
+on:
+  push:
+    branches: [ main, master ]
+
+# Fresh concurrency group so the stuck Nov 11 runs cannot block this workflow
+concurrency:
+  group: fx-live-systemd-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.GCP_SSH_PRIVATE_KEY }}
+
+      - name: Add GCP VM to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.GCP_VM_IP }} >> ~/.ssh/known_hosts
+
+      - name: Sync updated code to GCP VM
+        run: |
+          rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' --exclude 'scanner.log' ./ ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }}:~/fx_scanner/
+
+      - name: Restart fx_scanner Linux Service
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }} << 'EOF'
+            cd ~/fx_scanner
+            ./venv/bin/pip install requests pandas numpy flask joblib scikit-learn xgboost --quiet
+            sudo systemctl restart fx_scanner
+            sleep 2
+            sudo systemctl is-active --quiet fx_scanner && echo "✅ Live App Updated & Running!" || (cat scanner.log && exit 1)
+          EOF
