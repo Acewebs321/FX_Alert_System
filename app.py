@@ -658,7 +658,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EUR_JPY & GBP_JPY ML Scanner</title>
+    <title>ML Scanner</title>
     <style>
         :root {
             --bg-base: #0f172a;
@@ -801,12 +801,12 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="header">
-        <h1>JPY Crosses Trading Alert Dashboard (EUR_JPY & GBP_JPY ML)</h1>
+        <h1>Trading Alert Dashboard</h1>
     </div>
     
     <div class="container">
         <div class="panel panel-controls">
-            <h2>System Control (EUR_JPY / GBP_JPY)</h2>
+            <h2>System Control</h2>
             <div class="control-group">
                 <select id="symbol-select">
                     {% for pair in pairs %}
