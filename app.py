@@ -728,306 +728,1415 @@ def run_fvg_scanner():
         elapsed = time.monotonic() - cycle_start
         time.sleep(max(1, SCAN_INTERVAL - elapsed))
 
+
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ML Scanner</title>
+    <meta name="theme-color" content="#080d18">
+    <title>FX Pulse | Trading Intelligence</title>
+
     <style>
         :root {
-            --bg-base: #0f172a;
-            --bg-panel: #1e293b;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --accent: #3b82f6;
-            --accent-hover: #2563eb;
-            --border: #334155;
-            --log-bg: #020617;
-            --log-text: #a3e635;
+            --bg: #080d18;
+            --bg-secondary: #0c1424;
+            --panel: rgba(16, 27, 45, 0.88);
+            --panel-hover: rgba(20, 35, 57, 0.96);
+            --cyan: #00e5ff;
+            --blue: #3984ff;
+            --purple: #a855f7;
+            --green: #00f5a0;
+            --red: #ff4d6d;
+            --yellow: #ffbd4a;
+            --text: #f1f5f9;
+            --muted: #8493a8;
+            --border: rgba(148, 163, 184, 0.13);
+            --log-bg: #050a13;
         }
 
-        * { box-sizing: border-box; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
 
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif; 
-            background-color: var(--bg-base); 
-            color: var(--text-main); 
-            margin: 0; 
-            padding: 16px; 
-            line-height: 1.5;
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            min-height: 100vh;
+            font-family: Inter, -apple-system, BlinkMacSystemFont,
+                'Segoe UI', Roboto, sans-serif;
+            background:
+                radial-gradient(ellipse at 10% 10%,
+                    rgba(0, 229, 255, .08), transparent 38%),
+                radial-gradient(ellipse at 90% 85%,
+                    rgba(168, 85, 247, .09), transparent 38%),
+                var(--bg);
+            background-attachment: fixed;
+            color: var(--text);
+            padding: 26px;
+            overflow-x: hidden;
+        }
+
+        /* Background ambient effects */
+
+        .fx-glow {
+            position: fixed;
+            width: 300px;
+            height: 300px;
+            border-radius: 50%;
+            filter: blur(110px);
+            opacity: .15;
+            pointer-events: none;
+            z-index: -1;
+            animation: floatGlow 14s ease-in-out infinite alternate;
+        }
+
+        .fx-glow.cyan {
+            background: var(--cyan);
+            top: 8%;
+            left: -130px;
+        }
+
+        .fx-glow.purple {
+            background: var(--purple);
+            right: -130px;
+            bottom: 5%;
+            animation-delay: -7s;
+        }
+
+        @keyframes floatGlow {
+            0% {
+                transform: translate(0, 0) scale(1);
+            }
+            50% {
+                transform: translate(70px, 50px) scale(1.2);
+            }
+            100% {
+                transform: translate(-20px, 100px) scale(.9);
+            }
+        }
+
+        /* Main layout */
+
+        .dashboard {
+            max-width: 1500px;
+            margin: auto;
+            position: relative;
+            z-index: 1;
         }
 
         .header {
-            margin-bottom: 24px;
-            text-align: center;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+            margin-bottom: 28px;
+            flex-wrap: wrap;
         }
 
-        .header h1 {
-            margin: 0;
-            font-size: 1.5rem;
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .brand-icon {
+            width: 48px;
+            height: 48px;
+            display: grid;
+            place-items: center;
+            border-radius: 14px;
+            background: linear-gradient(135deg, #00c6e8, #6654ed);
+            color: white;
+            font-size: 23px;
+            font-weight: 900;
+            box-shadow: 0 0 25px rgba(0, 229, 255, .2);
+        }
+
+        .brand-name {
+            font-size: 1.65rem;
+            font-weight: 850;
+            letter-spacing: 2px;
+            background: linear-gradient(
+                90deg,
+                #fff,
+                var(--cyan),
+                #fff,
+                var(--purple),
+                #fff
+            );
+            background-size: 300% auto;
+            color: transparent;
+            background-clip: text;
+            -webkit-background-clip: text;
+            animation: logoShine 6s linear infinite;
+        }
+
+        @keyframes logoShine {
+            to {
+                background-position: 300% center;
+            }
+        }
+
+        .brand-subtitle {
+            color: var(--muted);
+            font-size: .75rem;
+            letter-spacing: 2px;
+            margin-top: 3px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+            padding: 10px 15px;
+            border: 1px solid rgba(0, 245, 160, .2);
+            background: rgba(0, 245, 160, .05);
+            border-radius: 30px;
+            color: var(--green);
+            font-size: .75rem;
             font-weight: 700;
+            letter-spacing: 1px;
         }
 
-        .container { 
-            display: flex; 
-            flex-direction: column; 
-            gap: 20px; 
-            max-width: 1400px;
-            margin: 0 auto;
+        .status-dot {
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: var(--green);
+            box-shadow: 0 0 10px var(--green);
+            animation: statusPulse 1.5s ease-in-out infinite;
+            display: inline-block;
+            flex-shrink: 0;
         }
 
-        @media (min-width: 992px) {
-            .container { flex-direction: row; }
-            .header { text-align: left; max-width: 1400px; margin: 0 auto 24px auto; }
-            body { padding: 32px; }
+        .status-dot.warning {
+            background: var(--yellow);
+            box-shadow: 0 0 10px var(--yellow);
         }
 
-        .panel { 
-            background-color: var(--bg-panel); 
-            border: 1px solid var(--border); 
-            padding: 24px; 
-            border-radius: 12px; 
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        .status-dot.offline {
+            background: var(--red);
+            box-shadow: 0 0 10px var(--red);
+            animation: none;
         }
 
-        .panel-controls { flex: 1; min-width: 320px; }
-        .panel-logs { flex: 2; display: flex; flex-direction: column; }
+        @keyframes statusPulse {
+            0%, 100% {
+                opacity: 1;
+                transform: scale(1);
+            }
+            50% {
+                opacity: .45;
+                transform: scale(1.4);
+            }
+        }
 
-        h2 { 
-            color: var(--text-main); 
-            font-size: 1.1rem;
+        .clock {
+            color: var(--muted);
+            font-size: .85rem;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Main grid */
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: minmax(320px, .9fr) minmax(0, 1.6fr);
+            gap: 22px;
+            align-items: stretch;
+        }
+
+        .left-column {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            min-width: 0;
+        }
+
+        .right-column {
+            min-width: 0;
+        }
+
+        .panel {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 17px;
+            padding: 22px;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 10px 35px rgba(0, 0, 0, .2);
+            transition:
+                transform .3s ease,
+                border-color .3s ease,
+                box-shadow .3s ease;
+            min-width: 0;
+        }
+
+        .panel:hover {
+            border-color: rgba(0, 229, 255, .28);
+            box-shadow: 0 12px 38px rgba(0, 229, 255, .06);
+        }
+
+        .panel-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 18px;
+        }
+
+        .panel-title {
+            font-size: .88rem;
+            font-weight: 750;
+            letter-spacing: 1.3px;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
-            border-bottom: 1px solid var(--border); 
-            padding-bottom: 12px; 
-            margin-top: 0; 
-            margin-bottom: 16px;
+            color: #e2e8f0;
         }
+
+        .panel-tag {
+            color: var(--cyan);
+            font-size: .65rem;
+            letter-spacing: 1px;
+            font-weight: 700;
+            background: rgba(0, 229, 255, .08);
+            padding: 5px 9px;
+            border-radius: 6px;
+        }
+
+        .section-divider {
+            border: 0;
+            border-top: 1px solid var(--border);
+            margin: 22px 0;
+        }
+
+        /* Pair selector */
 
         .control-group {
             display: flex;
             gap: 10px;
-            margin-bottom: 24px;
-            flex-wrap: wrap;
         }
 
-        select { 
+        select {
             flex: 1;
-            padding: 10px; 
-            background: var(--bg-base); 
-            color: var(--text-main); 
-            border: 1px solid var(--border); 
-            border-radius: 6px; 
-            font-size: 1rem;
+            min-width: 0;
+            padding: 12px 14px;
+            background: #080f1d;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            font-size: .9rem;
             outline: none;
+            cursor: pointer;
         }
 
-        select:focus { border-color: var(--accent); }
+        select:focus {
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px rgba(0, 229, 255, .08);
+        }
 
-        button { 
-            padding: 10px 16px; 
-            background: var(--accent); 
-            color: white; 
-            border: none; 
-            border-radius: 6px;
-            font-size: 0.95rem; 
-            font-weight: 600; 
-            cursor: pointer; 
-            transition: background 0.2s; 
+        button {
+            padding: 12px 20px;
+            border: 0;
+            border-radius: 9px;
+            background: linear-gradient(135deg, #00bcd4, #3975ee);
+            color: white;
+            font-size: .85rem;
+            font-weight: 750;
+            cursor: pointer;
+            transition: all .25s ease;
+            white-space: nowrap;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(0, 229, 255, .2);
+        }
+
+        button:active {
+            transform: scale(.97);
+        }
+
+        /* Scanner activity waveform */
+
+        .activity-box {
+            background: rgba(5, 10, 19, .6);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 14px;
+            margin-top: 17px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .activity-label {
+            color: var(--muted);
+            font-size: .72rem;
+            letter-spacing: 1px;
+        }
+
+        .activity-value {
+            color: var(--green);
+            font-size: .78rem;
+            font-weight: 750;
+            margin-top: 5px;
+        }
+
+        .market-wave {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 4px;
+            height: 45px;
             flex-shrink: 0;
         }
 
-        button:hover { background: var(--accent-hover); }
-
-        .status-row { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center;
-            padding: 12px 0; 
-            border-bottom: 1px solid var(--border); 
-        }
-
-        .status-row:last-child { border-bottom: none; padding-bottom: 0; }
-
-        .status-label { font-weight: 500; color: var(--text-muted); }
-        .status-val { font-weight: 600; text-align: right; }
-
-        #log-container { 
-            background-color: var(--log-bg); 
-            border: 1px solid var(--border); 
+        .market-wave span {
+            display: block;
+            width: 4px;
+            height: 12px;
             border-radius: 8px;
-            padding: 16px; 
-            height: 60vh; 
-            min-height: 300px;
-            overflow-y: auto; 
-            font-family: 'Consolas', 'Monaco', monospace; 
-            white-space: pre-wrap; 
-            font-size: 0.85rem; 
-            color: var(--log-text);
-            flex-grow: 1;
+            background: linear-gradient(
+                180deg,
+                var(--cyan),
+                var(--purple)
+            );
+            box-shadow: 0 0 8px rgba(0, 229, 255, .35);
+            animation: waveMove .9s ease-in-out infinite alternate;
         }
 
-        ::-webkit-scrollbar { width: 8px; }
-        ::-webkit-scrollbar-track { background: var(--bg-base); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+        .market-wave span:nth-child(2n) {
+            animation-delay: -.3s;
+        }
+
+        .market-wave span:nth-child(3n) {
+            animation-delay: -.6s;
+        }
+
+        .market-wave span:nth-child(4n) {
+            animation-delay: -.45s;
+        }
+
+        @keyframes waveMove {
+            from {
+                height: 7px;
+                opacity: .5;
+            }
+            to {
+                height: 40px;
+                opacity: 1;
+            }
+        }
+
+        /* Pair status cards */
+
+        #pair-status-container {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 10px;
+        }
+
+        .pair-card {
+            background: rgba(5, 12, 24, .72);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 15px;
+            transition: all .25s ease;
+            animation: cardEnter .5s ease both;
+        }
+
+        .pair-card:hover {
+            border-color: rgba(0, 229, 255, .35);
+            transform: translateY(-3px);
+            background: var(--panel-hover);
+        }
+
+        .pair-card-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .pair-name {
+            font-size: 1rem;
+            font-weight: 800;
+            letter-spacing: .7px;
+        }
+
+        .pair-health {
+            font-size: .72rem;
+            font-weight: 700;
+        }
+
+        .pair-info {
+            color: var(--muted);
+            font-size: .78rem;
+            line-height: 1.8;
+        }
+
+        .pair-last-alert {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--border);
+            color: #b8c6d8;
+            font-size: .72rem;
+        }
+
+        @keyframes cardEnter {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Health status rows */
+
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .status-row:last-child {
+            border-bottom: none;
+            padding-bottom: 0;
+        }
+
+        .status-label {
+            color: var(--muted);
+            font-size: .82rem;
+        }
+
+        .status-val {
+            font-size: .82rem;
+            font-weight: 750;
+            text-align: right;
+            overflow-wrap: anywhere;
+        }
+
+        .status-value-wrap {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            text-align: right;
+        }
+
+        /* Scanner task */
+
+        .task-value {
+            color: var(--yellow);
+        }
+
+        /* News cards */
+
+        #news-container {
+            display: flex;
+            flex-direction: column;
+            gap: 9px;
+        }
+
+        .news-card {
+            background: rgba(5, 12, 24, .72);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 13px;
+            transition: border-color .2s ease;
+        }
+
+        .news-card:hover {
+            border-color: rgba(0, 229, 255, .3);
+        }
+
+        .news-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        .news-impact {
+            font-size: .7rem;
+            font-weight: 800;
+            letter-spacing: .7px;
+        }
+
+        .news-status {
+            font-size: .7rem;
+            font-weight: 700;
+        }
+
+        .news-title {
+            font-size: .83rem;
+            font-weight: 650;
+            margin-bottom: 8px;
+        }
+
+        .news-meta {
+            display: flex;
+            justify-content: space-between;
+            gap: 8px;
+            flex-wrap: wrap;
+            color: var(--muted);
+            font-size: .72rem;
+        }
+
+        .empty-news {
+            color: var(--green);
+            font-size: .82rem;
+            padding: 12px 0;
+        }
+
+        /* Logs panel */
+
+        .logs-panel {
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            min-height: 600px;
+        }
+
+        .logs-heading-right {
+            display: flex;
+            align-items: center;
+            gap: 9px;
+        }
+
+        .terminal-label {
+            color: var(--green);
+            font-size: .67rem;
+            font-weight: 750;
+            letter-spacing: 1px;
+        }
+
+        #log-container {
+            position: relative;
+            overflow: auto;
+            flex: 1;
+            min-height: 450px;
+            max-height: 75vh;
+            padding: 18px;
+            border: 1px solid rgba(0, 229, 255, .12);
+            border-radius: 12px;
+            background: var(--log-bg);
+            color: #a3e6b5;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: .79rem;
+            line-height: 1.9;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            box-shadow: inset 0 0 30px rgba(0, 0, 0, .35);
+        }
+
+        /* Scanner sweep over logs */
+
+        .logs-panel #log-container::after {
+            content: "";
+            position: absolute;
+            top: -100%;
+            left: 0;
+            width: 100%;
+            height: 75%;
+            pointer-events: none;
+            background: linear-gradient(
+                180deg,
+                transparent,
+                rgba(0, 229, 255, .055),
+                transparent
+            );
+            animation: scannerSweep 6s linear infinite;
+        }
+
+        @keyframes scannerSweep {
+            0% {
+                top: -100%;
+            }
+            100% {
+                top: 150%;
+            }
+        }
+
+        /* Scrollbars */
+
+        ::-webkit-scrollbar {
+            width: 7px;
+            height: 7px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #080f1d;
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #263c55;
+            border-radius: 5px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--cyan);
+        }
+
+        /* Footer */
+
+        .footer {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+            padding: 20px 4px 5px;
+            color: #65758b;
+            font-size: .7rem;
+            letter-spacing: .5px;
+        }
+
+        /* Responsive layout */
+
+        @media (max-width: 1050px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .logs-panel {
+                min-height: 480px;
+            }
+
+            #log-container {
+                min-height: 380px;
+                max-height: 55vh;
+            }
+        }
+
+        @media (max-width: 600px) {
+            body {
+                padding: 15px;
+            }
+
+            .header {
+                align-items: flex-start;
+                margin-bottom: 20px;
+            }
+
+            .brand-name {
+                font-size: 1.35rem;
+            }
+
+            .brand-icon {
+                width: 42px;
+                height: 42px;
+                font-size: 20px;
+            }
+
+            .header-right {
+                width: 100%;
+                justify-content: space-between;
+            }
+
+            .panel {
+                padding: 17px;
+                border-radius: 14px;
+            }
+
+            .main-grid {
+                gap: 16px;
+            }
+
+            .left-column {
+                gap: 16px;
+            }
+
+            .control-group {
+                flex-direction: column;
+            }
+
+            .control-group button {
+                width: 100%;
+            }
+
+            .status-row {
+                align-items: flex-start;
+            }
+
+            .status-val {
+                max-width: 58%;
+            }
+
+            .logs-panel {
+                min-height: 430px;
+            }
+
+            #log-container {
+                min-height: 330px;
+                max-height: 55vh;
+                font-size: .72rem;
+                padding: 13px;
+            }
+
+            .footer {
+                flex-direction: column;
+            }
+        }
+
+        /* Accessibility */
+
+        @media (prefers-reduced-motion: reduce) {
+            *,
+            *::before,
+            *::after {
+                animation-duration: .01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: .01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
     </style>
 </head>
+
 <body>
-    <div class="header">
-        <h1>Trading Alert Dashboard</h1>
-        <p style="color:#94a3b8;margin:6px 0 0;">EUR/JPY and GBP/JPY are scanned independently.</p>
+
+    <div class="fx-glow cyan"></div>
+    <div class="fx-glow purple"></div>
+
+    <div class="dashboard">
+
+        <!-- HEADER -->
+
+        <header class="header">
+
+            <div class="brand">
+                <div class="brand-icon">FX</div>
+
+                <div>
+                    <div class="brand-name">FX PULSE</div>
+                    <div class="brand-subtitle">
+                        INTELLIGENT TRADING ALERT SYSTEM
+                    </div>
+                </div>
+            </div>
+
+            <div class="header-right">
+
+                <div class="live-indicator">
+                    <span class="status-dot"></span>
+                    SYSTEM MONITOR
+                </div>
+
+                <div class="clock" id="uk-clock">
+                    UK TIME --:--:--
+                </div>
+
+            </div>
+
+        </header>
+
+
+        <!-- MAIN DASHBOARD -->
+
+        <main class="main-grid">
+
+            <!-- LEFT COLUMN -->
+
+            <div class="left-column">
+
+                <!-- SCANNER CONTROL PANEL -->
+
+                <section class="panel">
+
+                    <div class="panel-heading">
+                        <h2 class="panel-title">Dashboard View</h2>
+                        <span class="panel-tag">DUAL PAIR</span>
+                    </div>
+
+                    <p style="color:var(--muted);font-size:.8rem;margin-bottom:15px;">
+                        Both currency pairs are scanned independently.
+                        Select a pair to change the dashboard view.
+                    </p>
+
+                    <div class="control-group">
+
+                        <select id="symbol-select">
+                            {% for pair in pairs %}
+                            <option value="{{ pair }}"
+                                {% if pair == current_symbol %}selected{% endif %}>
+                                {{ pair }}
+                            </option>
+                            {% endfor %}
+                        </select>
+
+                        <button id="apply-button" onclick="updateSymbol()">
+                            Apply
+                        </button>
+
+                    </div>
+
+                    <div class="activity-box">
+
+                        <div>
+                            <div class="activity-label">SCANNER ACTIVITY</div>
+                            <div class="activity-value">
+                                MONITORING MARKETS
+                            </div>
+                        </div>
+
+                        <div class="market-wave" aria-label="Animated visual activity indicator">
+                            <span></span><span></span><span></span><span></span>
+                            <span></span><span></span><span></span><span></span>
+                            <span></span><span></span><span></span><span></span>
+                            <span></span><span></span><span></span><span></span>
+                        </div>
+
+                    </div>
+
+                    <hr class="section-divider">
+
+                    <!-- BOTH PAIR SCANNERS -->
+
+                    <div class="panel-heading">
+                        <h2 class="panel-title">Pair Scanners</h2>
+                        <span class="panel-tag">LIVE STATUS</span>
+                    </div>
+
+                    <div id="pair-status-container">
+                        <div style="color:var(--muted);font-size:.8rem;">
+                            Loading pair status...
+                        </div>
+                    </div>
+
+                </section>
+
+
+                <!-- API AND ML HEALTH -->
+
+                <section class="panel">
+
+                    <div class="panel-heading">
+                        <h2 class="panel-title">API & ML Health</h2>
+                        <span class="panel-tag">SELECTED PAIR</span>
+                    </div>
+
+                    <div class="status-row">
+                        <span class="status-label">OANDA API</span>
+                        <div class="status-value-wrap">
+                            <span class="status-dot" id="oanda-dot"></span>
+                            <span class="status-val" id="oanda-health">...</span>
+                        </div>
+                    </div>
+
+                    <div class="status-row">
+                        <span class="status-label">Telegram API</span>
+                        <div class="status-value-wrap">
+                            <span class="status-dot" id="tele-dot"></span>
+                            <span class="status-val" id="tele-health">...</span>
+                        </div>
+                    </div>
+
+                    <div class="status-row">
+                        <span class="status-label">ML Revisit Engine</span>
+                        <div class="status-value-wrap">
+                            <span class="status-dot" id="ml-dot"></span>
+                            <span class="status-val" id="ml-health">...</span>
+                        </div>
+                    </div>
+
+                    <hr class="section-divider">
+
+                    <div class="panel-heading">
+                        <h2 class="panel-title">Scanner Activity</h2>
+                        <span class="panel-tag">ENGINE</span>
+                    </div>
+
+                    <div class="status-row">
+                        <span class="status-label">Current Task</span>
+                        <span class="status-val task-value" id="scan-task">...</span>
+                    </div>
+
+                    <div class="status-row">
+                        <span class="status-label">M5 Trend Filter</span>
+                        <span class="status-val" id="m5-trend">...</span>
+                    </div>
+
+                </section>
+
+
+                <!-- ECONOMIC CALENDAR -->
+
+                <section class="panel">
+
+                    <div class="panel-heading">
+                        <h2 class="panel-title">Economic Calendar</h2>
+                        <span class="panel-tag">UK TIME</span>
+                    </div>
+
+                    <div id="news-container">
+                        <div style="color:var(--muted);font-size:.8rem;">
+                            Checking calendar...
+                        </div>
+                    </div>
+
+                </section>
+
+            </div>
+
+
+            <!-- RIGHT COLUMN: SYSTEM LOGS -->
+
+            <div class="right-column">
+
+                <section class="panel logs-panel">
+
+                    <div class="panel-heading">
+
+                        <div>
+                            <h2 class="panel-title">System Logs</h2>
+                            <p style="color:var(--muted);font-size:.75rem;margin-top:5px;">
+                                Real-time scanner activity and system events
+                            </p>
+                        </div>
+
+                        <div class="logs-heading-right">
+                            <span class="status-dot"></span>
+                            <span class="terminal-label">LIVE TERMINAL</span>
+                        </div>
+
+                    </div>
+
+                    <div id="log-container">
+                        Loading logs...
+                    </div>
+
+                </section>
+
+            </div>
+
+        </main>
+
+
+        <!-- FOOTER -->
+
+        <footer class="footer">
+            <span>FX PULSE · TRADING INTELLIGENCE SYSTEM</span>
+            <span>EUR/JPY & GBP/JPY MONITORING</span>
+        </footer>
+
     </div>
-    
-    <div class="container">
-        <div class="panel panel-controls">
-            <h2>Dashboard View (Both Pairs Scan)</h2>
-            <div class="control-group">
-                <select id="symbol-select">
-                    {% for pair in pairs %}
-                    <option value="{{ pair }}" {% if pair == current_symbol %}selected{% endif %}>{{ pair }}</option>
-                    {% endfor %}
-                </select>
-                <button onclick="updateSymbol()">Apply</button>
-            </div>
-            
-            <h2>Both Pair Scanners</h2>
-            <div id="pair-status-container" style="margin-bottom: 24px; color: #94a3b8;">Loading pair status...</div>
 
-            <h2>Selected Pair API & ML Health</h2>
-            <div class="status-row">
-                <span class="status-label">OANDA API:</span>
-                <span class="status-val" id="oanda-health">...</span>
-            </div>
-            <div class="status-row">
-                <span class="status-label">Telegram API:</span>
-                <span class="status-val" id="tele-health">...</span>
-            </div>
-            <div class="status-row">
-                <span class="status-label">ML Revisit Engine:</span>
-                <span class="status-val" id="ml-health">...</span>
-            </div>
-            
-            <h2 style="margin-top: 24px;">Scanner Activity</h2>
-            <div class="status-row">
-                <span class="status-label">Current Task:</span>
-                <span class="status-val" id="scan-task" style="color: #fbbf24;">...</span>
-            </div>
-            <div class="status-row">
-                <span class="status-label">M5 Trend Filter:</span>
-                <span class="status-val" id="m5-trend">...</span>
-            </div>
 
-            <h2 style="margin-top: 24px;">Today's Pair News (UK Time)</h2>
-            <div id="news-container">Checking calendar...</div>
-        </div>
-
-        <div class="panel panel-logs">
-            <h2>System Logs</h2>
-            <div id="log-container">Loading logs...</div>
-        </div>
-    </div>
+    <!-- JAVASCRIPT -->
 
     <script>
-        function updateSymbol() {
-            const newSymbol = document.getElementById("symbol-select").value;
-            const btn = document.querySelector('button');
-            const originalText = btn.innerText;
-            btn.innerText = "Applying...";
-            
-            fetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ symbol: newSymbol })
-            })
-            .then(res => res.json())
-            .then(data => {
-                btn.innerText = originalText;
-                const taskRow = document.getElementById('scan-task');
-                taskRow.style.color = '#34d399';
-                setTimeout(() => taskRow.style.color = '#fbbf24', 2000);
-                fetchData();
-            })
-            .catch(() => {
-                btn.innerText = "Error";
-                setTimeout(() => btn.innerText = originalText, 2000);
+
+        // UK CLOCK
+
+        function updateClock() {
+            const now = new Date();
+
+            const time = now.toLocaleTimeString('en-GB', {
+                timeZone: 'Europe/London',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
             });
+
+            document.getElementById('uk-clock').innerText =
+                'UK TIME ' + time;
         }
 
+        updateClock();
+        setInterval(updateClock, 1000);
+
+
+        // UPDATE SELECTED PAIR
+
+        function updateSymbol() {
+
+            const newSymbol =
+                document.getElementById("symbol-select").value;
+
+            const btn = document.getElementById("apply-button");
+            const originalText = btn.innerText;
+
+            btn.innerText = "Applying...";
+            btn.disabled = true;
+
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    symbol: newSymbol
+                })
+            })
+
+            .then(res => {
+                if (!res.ok) {
+                    throw new Error("Unable to update symbol");
+                }
+                return res.json();
+            })
+
+            .then(data => {
+
+                btn.innerText = "Updated";
+
+                const taskRow = document.getElementById('scan-task');
+
+                taskRow.style.color = '#00f5a0';
+
+                setTimeout(() => {
+                    taskRow.style.color = '';
+                    btn.innerText = originalText;
+                    btn.disabled = false;
+                }, 1500);
+
+                fetchData();
+
+            })
+
+            .catch(error => {
+
+                console.error("Symbol update error:", error);
+
+                btn.innerText = "Error";
+
+                setTimeout(() => {
+                    btn.innerText = originalText;
+                    btn.disabled = false;
+                }, 2000);
+
+            });
+
+        }
+
+
+        // RENDER ECONOMIC NEWS
+
         function renderNews(newsList, symbol) {
-            const container = document.getElementById('news-container');
+
+            const container =
+                document.getElementById('news-container');
+
             if (!newsList || newsList.length === 0) {
-                container.innerHTML = `<div style="color: #34d399; font-size: 0.9rem;">🟢 No High/Medium news today for ${symbol}</div>`;
+
+                container.innerHTML = `
+                    <div class="empty-news">
+                        🟢 No High/Medium news today for ${symbol}
+                    </div>
+                `;
+
                 return;
             }
 
             container.innerHTML = newsList.map(item => {
-                const badgeColor = item.impact === 'High' ? '#ef4444' : '#f59e0b';
-                const statusColor = item.status === 'ACTIVE NOW' ? '#ef4444' : (item.status === 'Passed' ? '#64748b' : '#fbbf24');
+
+                const badgeColor =
+                    item.impact === 'High' ? '#ff4d6d' : '#ffbd4a';
+
+                const statusColor =
+                    item.status === 'ACTIVE NOW'
+                        ? '#ff4d6d'
+                        : (item.status === 'Passed'
+                            ? '#8493a8'
+                            : '#ffbd4a');
+
                 return `
-                    <div style="background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 10px; margin-bottom: 8px; font-size: 0.85rem;">
-                        <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
-                            <span style="color: ${badgeColor}; font-weight: 700;">${item.currency} • ${item.impact.toUpperCase()}</span>
-                            <span style="font-weight: 700; color: ${statusColor};">${item.status}</span>
+
+                    <div class="news-card">
+
+                        <div class="news-top">
+
+                            <span class="news-impact"
+                                style="color:${badgeColor};">
+                                ${item.currency} • ${item.impact.toUpperCase()}
+                            </span>
+
+                            <span class="news-status"
+                                style="color:${statusColor};">
+                                ${item.status}
+                            </span>
+
                         </div>
-                        <div style="font-weight: 600; margin-bottom: 4px;">${item.title}</div>
-                        <div style="color: #94a3b8; display: flex; justify-content: space-between;">
-                            <span>Time: <strong>${item.time_uk}</strong></span>
-                            <span>Avoid (±5m): <strong>${item.window_uk}</strong></span>
+
+                        <div class="news-title">
+                            ${item.title}
                         </div>
+
+                        <div class="news-meta">
+
+                            <span>
+                                Time: <strong>${item.time_uk}</strong>
+                            </span>
+
+                            <span>
+                                Avoid (±5m):
+                                <strong>${item.window_uk}</strong>
+                            </span>
+
+                        </div>
+
                     </div>
+
                 `;
+
             }).join('');
+
         }
+
+
+        // RENDER BOTH PAIR STATUSES
 
         function renderPairStatuses(pairData) {
-            const container = document.getElementById('pair-status-container');
-            container.innerHTML = Object.entries(pairData || {}).map(([pair, info]) => `
-                <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;margin-bottom:8px;">
-                    <div style="display:flex;justify-content:space-between;gap:8px;">
-                        <strong style="color:#f8fafc;">${pair}</strong>
-                        <span style="color:${info.oanda_health.includes('Healthy') ? '#34d399' : '#fbbf24'};">${info.oanda_health}</span>
+
+            const container =
+                document.getElementById('pair-status-container');
+
+            if (!pairData || Object.keys(pairData).length === 0) {
+
+                container.innerHTML = `
+                    <div style="color:var(--muted);font-size:.8rem;">
+                        Pair status unavailable.
                     </div>
-                    <div style="font-size:.85rem;margin-top:5px;">${info.scanner_status}</div>
-                    <div style="font-size:.8rem;margin-top:3px;">M5 trend: ${info.m5_trend} · ML: ${info.ml_status}</div>
-                    <div style="font-size:.8rem;margin-top:3px;">Last alert: ${info.last_alert || 'None yet'}</div>
-                </div>
-            `).join('');
+                `;
+
+                return;
+            }
+
+            container.innerHTML = Object.entries(pairData).map(
+                ([pair, info]) => {
+
+                    const healthy =
+                        info.oanda_health &&
+                        info.oanda_health.includes('Healthy');
+
+                    const healthColor =
+                        healthy ? '#00f5a0' : '#ffbd4a';
+
+                    const dotClass =
+                        healthy ? 'status-dot' : 'status-dot warning';
+
+                    return `
+
+                        <div class="pair-card">
+
+                            <div class="pair-card-top">
+
+                                <span class="pair-name">
+                                    ${pair}
+                                </span>
+
+                                <span class="pair-health"
+                                    style="color:${healthColor};">
+                                    <span class="${dotClass}"
+                                        style="width:7px;height:7px;margin-right:5px;">
+                                    </span>
+                                    ${info.oanda_health || 'Unknown'}
+                                </span>
+
+                            </div>
+
+                            <div class="pair-info">
+                                Scanner: ${info.scanner_status || 'Unknown'}
+                            </div>
+
+                            <div class="pair-info">
+                                M5 Trend: ${info.m5_trend || 'Unknown'}
+                                · ML: ${info.ml_status || 'Unknown'}
+                            </div>
+
+                            <div class="pair-last-alert">
+                                Last alert: ${info.last_alert || 'None yet'}
+                            </div>
+
+                        </div>
+
+                    `;
+
+                }
+
+            ).join('');
+
         }
 
+
+        // UPDATE STATUS INDICATORS
+
+        function updateStatusDot(dotId, status, isHealthy) {
+
+            const dot = document.getElementById(dotId);
+
+            if (!dot) return;
+
+            dot.className = 'status-dot';
+
+            if (!isHealthy) {
+                dot.classList.add('warning');
+            }
+
+            if (
+                status &&
+                (
+                    status.includes('Error') ||
+                    status.includes('Disconnected') ||
+                    status.includes('Failed')
+                )
+            ) {
+                dot.className = 'status-dot offline';
+            }
+
+        }
+
+
+        // FETCH DASHBOARD DATA
+
         function fetchData() {
+
             fetch('/api/data')
-                .then(res => res.json())
+
+                .then(res => {
+                    if (!res.ok) {
+                        throw new Error("Dashboard API unavailable");
+                    }
+                    return res.json();
+                })
+
                 .then(data => {
-                    document.getElementById('oanda-health').innerText = data.state.oanda_health;
-                    document.getElementById('tele-health').innerText = data.state.telegram_health;
-                    document.getElementById('ml-health').innerText = data.state.ml_status;
-                    document.getElementById('scan-task').innerText = data.state.scanner_status;
-                    document.getElementById('m5-trend').innerText = data.state.m5_trend;
-                    renderNews(data.state.todays_news, data.state.symbol);
-                    
-                    document.getElementById('oanda-health').style.color = data.state.oanda_health.includes('Error') ? '#ef4444' : '#34d399';
-                    document.getElementById('tele-health').style.color = data.state.telegram_health.includes('Error') ? '#ef4444' : '#34d399';
-                    document.getElementById('ml-health').style.color = data.state.ml_status.includes('Loaded') ? '#34d399' : '#fbbf24';
-                    
-                    const logBox = document.getElementById('log-container');
-                    const isScrolledToBottom = logBox.scrollHeight - logBox.clientHeight <= logBox.scrollTop + 5;
-                    logBox.innerHTML = data.logs.join('<br>');
-                    
+
+                    if (!data.state) return;
+
+                    // Health values
+
+                    document.getElementById('oanda-health').innerText =
+                        data.state.oanda_health || 'Unknown';
+
+                    document.getElementById('tele-health').innerText =
+                        data.state.telegram_health || 'Unknown';
+
+                    document.getElementById('ml-health').innerText =
+                        data.state.ml_status || 'Unknown';
+
+                    document.getElementById('scan-task').innerText =
+                        data.state.scanner_status || 'Unknown';
+
+                    document.getElementById('m5-trend').innerText =
+                        data.state.m5_trend || 'Unknown';
+
+
+                    // Health colours
+
+                    const oandaHealthy =
+                        data.state.oanda_health &&
+                        !data.state.oanda_health.includes('Error');
+
+                    const telegramHealthy =
+                        data.state.telegram_health &&
+                        !data.state.telegram_health.includes('Error');
+
+                    const mlHealthy =
+                        data.state.ml_status &&
+                        data.state.ml_status.includes('Loaded');
+
+                    document.getElementById('oanda-health').style.color =
+                        oandaHealthy ? '#00f5a0' : '#ff4d6d';
+
+                    document.getElementById('tele-health').style.color =
+                        telegramHealthy ? '#00f5a0' : '#ff4d6d';
+
+                    document.getElementById('ml-health').style.color =
+                        mlHealthy ? '#00f5a0' : '#ffbd4a';
+
+
+                    // Animated health indicators
+
+                    updateStatusDot(
+                        'oanda-dot',
+                        data.state.oanda_health,
+                        oandaHealthy
+                    );
+
+                    updateStatusDot(
+                        'tele-dot',
+                        data.state.telegram_health,
+                        telegramHealthy
+                    );
+
+                    updateStatusDot(
+                        'ml-dot',
+                        data.state.ml_status,
+                        mlHealthy
+                    );
+
+
+                    // Calendar
+
+                    renderNews(
+                        data.state.todays_news,
+                        data.state.symbol
+                    );
+
+
+                    // Logs - preserve user's scroll position
+
+                    const logBox =
+                        document.getElementById('log-container');
+
+                    const isScrolledToBottom =
+                        logBox.scrollHeight -
+                        logBox.clientHeight <=
+                        logBox.scrollTop + 5;
+
+                    if (Array.isArray(data.logs)) {
+                        logBox.innerHTML =
+                            data.logs.join('<br>');
+                    }
+
                     if (isScrolledToBottom) {
                         logBox.scrollTop = logBox.scrollHeight;
                     }
+
+                })
+
+                .catch(error => {
+                    console.error("Dashboard refresh error:", error);
                 });
+
         }
-        
+
+
+        // INITIAL LOAD AND AUTOMATIC REFRESH
+
         fetchData();
+
         setInterval(fetchData, 3000);
+
     </script>
+
 </body>
 </html>
 """
+
 
 @app.route('/')
 def index():
