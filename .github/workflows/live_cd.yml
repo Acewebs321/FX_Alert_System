@@ -30,7 +30,15 @@ jobs:
 
       - name: Sync updated code to GCP VM
         run: |
-          rsync -avz --exclude '.git' --exclude 'venv' --exclude '__pycache__' --exclude 'scanner.log' ./ ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }}:~/fx_scanner/
+          rsync -avz \
+            --exclude '.git' \
+            --exclude 'venv' \
+            --exclude '__pycache__' \
+            --exclude 'scanner.log' \
+            --exclude 'alert_deduplication.sqlite3' \
+            --exclude 'alert_deduplication.sqlite3-wal' \
+            --exclude 'alert_deduplication.sqlite3-shm' \
+            ./ ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }}:~/fx_scanner/
 
       - name: Restart fx_scanner Linux Service
         run: |

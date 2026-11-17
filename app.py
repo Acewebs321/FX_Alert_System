@@ -1,15 +1,24 @@
-import requests
-import pandas as pd
-import numpy as np
-import time
 import os
 import threading
+import sqlite3
 import joblib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from collections import deque
 from flask import Flask, jsonify, request, render_template_string
+import time
 
+
+
+# CONFIGURATION & GLOBAL STATE
+# ==============================
+# Both pairs are scanned independently with their own ML model when available.
+app_state = {
+    "symbol": "EUR_JPY",  # Dashboard display selection only; both pairs are always scanned.
+    "oanda_health": "Waiting...", "telegram_health": "Waiting...",
+    "scanner_status": "Starting up...", "m5_trend": "Unknown",
+    "ml_status": "Checking model...", "todays_news": [], "pairs": {}
+}
 
 
 
@@ -34,35 +43,38 @@ TELEGRAM_CHAT_ID ="1110417286"
 OANDA_TOKEN = "56c3289f164a1a64b30de44241b6ec5a-4aa1d8f08ad01339e4ee2f4d6be3d7c9"
 # Supports both EUR_JPY and GBP_JPY with dedicated pair-specific ML models/thresholds
 AVAILABLE_PAIRS = ["EUR_JPY", "GBP_JPY"]
-
-
-
 SCAN_INTERVAL = 30
 FVG_LOOKBACK = 10
 M3_SMA_PERIOD = 20
 M5_SMA_PERIOD = 50
 FVG_LOOKAHEAD = 10
-
+M5_CACHE_SECONDS = 60
+MAX_SETUP_AGE_SECONDS = 30 * 60  # Never retain/act on a setup older than 30 minutes.
+DB_CLEANUP_INTERVAL_SECONDS = 5 * 60
+ALERT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_deduplication.sqlite3")
 MODEL_PATHS = {
     "EUR_JPY": ["fvg_revisit_model_EUR_JPY.joblib", "fvg_revisit_model.joblib"],
     "GBP_JPY": ["fvg_revisit_model_GBP_JPY.joblib"]
 }
-
-# Pair-specific default gap quantiles (GBP_JPY has ~1.25x wider average M3 range than EUR_JPY)
 PAIR_DEFAULTS = {
     "EUR_JPY": {"q25_gap": 0.006, "q50_gap": 0.012, "q75_gap": 0.024},
     "GBP_JPY": {"q25_gap": 0.008, "q50_gap": 0.015, "q75_gap": 0.030}
 }
-
 news_cache = {"timestamp": None, "data": []}
-pending_crossings = {}
-alerted_setups = set()
-ml_bundles = {"EUR_JPY": None, "GBP_JPY": None}
-
-# Dashboard Log Storage
+pending_crossings = {pair: {} for pair in AVAILABLE_PAIRS}
+last_processed_crossing = {pair: None for pair in AVAILABLE_PAIRS}
+sending_setups = set()
+alert_lock = threading.Lock()
+m5_cache = {pair: {"timestamp": 0.0, "trend": None, "sma50": None} for pair in AVAILABLE_PAIRS}
+ml_bundles = {pair: None for pair in AVAILABLE_PAIRS}
+pair_status = {
+    pair: {"oanda_health": "Waiting...", "scanner_status": "Starting up...",
+           "m5_trend": "Unknown", "ml_status": "Checking model...",
+           "last_candle": None, "last_alert": None}
+    for pair in AVAILABLE_PAIRS
+}
 MAX_LOGS = 100
 system_logs = deque(maxlen=MAX_LOGS)
-
 app = Flask(__name__)
 
 # ==============================
@@ -93,11 +105,116 @@ def load_ml_models():
     update_ml_status_badge()
 
 def update_ml_status_badge():
-    active_pair = app_state["symbol"]
-    if ml_bundles.get(active_pair) is not None:
-        app_state["ml_status"] = f"Loaded ({active_pair}) 🟢"
-    else:
-        app_state["ml_status"] = f"Stats Fallback ({active_pair}) 🟡"
+    for pair in AVAILABLE_PAIRS:
+        pair_status[pair]["ml_status"] = (
+            f"Loaded ({pair}) 🟢" if ml_bundles.get(pair) is not None
+            else f"Stats Fallback ({pair}) 🟡"
+        )
+    app_state["ml_status"] = "Both pair models checked"
+
+
+def initialise_alert_db():
+    """Create/migrate the SQLite de-duplication table with a 30-minute TTL."""
+    with sqlite3.connect(ALERT_DB_PATH, timeout=10) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS alert_setups (
+                setup_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                created_at REAL
+            )
+        """)
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(alert_setups)")
+        }
+        if "created_at" not in columns:
+            connection.execute("ALTER TABLE alert_setups ADD COLUMN created_at REAL")
+            # Existing records pre-date the TTL column; updated_at is the safest
+            # available timestamp for assigning their initial expiry.
+            connection.execute(
+                "UPDATE alert_setups SET created_at = updated_at WHERE created_at IS NULL"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_alert_setups_created_at "
+            "ON alert_setups(created_at)"
+        )
+        connection.commit()
+    cleanup_expired_setup_records()
+
+
+def cleanup_expired_setup_records(now=None):
+    """Delete SQLite setup records once they have been stored for 30 minutes."""
+    now = time.time() if now is None else now
+    cutoff = now - MAX_SETUP_AGE_SECONDS
+    with sqlite3.connect(ALERT_DB_PATH, timeout=10) as connection:
+        cursor = connection.execute(
+            "DELETE FROM alert_setups WHERE created_at IS NOT NULL AND created_at <= ?",
+            (cutoff,)
+        )
+        deleted = cursor.rowcount
+        connection.commit()
+    if deleted:
+        log_msg(f"SQLite cleanup: deleted {deleted} setup record(s) older than 30 minutes.")
+    return deleted
+
+
+def claim_setup(setup_id, stale_after=120):
+    """
+    Atomically reserve a setup before Telegram send.
+    A record is retained for at most 30 minutes from its first claim.
+    """
+    now = time.time()
+    cutoff = now - MAX_SETUP_AGE_SECONDS
+    with sqlite3.connect(ALERT_DB_PATH, timeout=10) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT status, updated_at, created_at FROM alert_setups WHERE setup_id = ?",
+            (setup_id,)
+        ).fetchone()
+
+        if row and row[2] is not None and row[2] <= cutoff:
+            connection.execute("DELETE FROM alert_setups WHERE setup_id = ?", (setup_id,))
+            row = None
+
+        if row and row[0] == "sent":
+            connection.commit()
+            return False
+        if row and row[0] == "claimed" and now - row[1] < stale_after:
+            connection.commit()
+            return False
+
+        connection.execute("""
+            INSERT INTO alert_setups (setup_id, status, updated_at, created_at)
+            VALUES (?, 'claimed', ?, ?)
+            ON CONFLICT(setup_id) DO UPDATE SET
+                status = 'claimed', updated_at = excluded.updated_at
+        """, (setup_id, now, now))
+        connection.commit()
+        return True
+
+
+def update_setup_status(setup_id, status):
+    with sqlite3.connect(ALERT_DB_PATH, timeout=10) as connection:
+        connection.execute(
+            "UPDATE alert_setups SET status = ?, updated_at = ? WHERE setup_id = ?",
+            (status, time.time(), setup_id)
+        )
+        connection.commit()
+
+
+def make_setup_id(symbol, setup, fvg):
+    return "|".join((symbol, setup["alert_type"],
+                     pd.Timestamp(setup["time"]).isoformat(),
+                     pd.Timestamp(fvg["time"]).isoformat()))
+
+
+def is_fvg_mitigated(df, fvg):
+    later = df.loc[df.index > fvg["time"]]
+    if later.empty:
+        return False
+    if fvg["type"] == "Bearish FVG":
+        return bool((later["High"] >= fvg["bottom"]).any())
+    return bool((later["Low"] <= fvg["top"]).any())
 
 def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
     """
@@ -124,7 +241,7 @@ def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
 
     sma_5m_50 = setup.get("m5_sma50")
     if sma_5m_50 is None or pd.isna(sma_5m_50):
-        _, sma_5m_50 = get_m5_trend_and_sma()
+        _, sma_5m_50 = get_m5_trend_and_sma(symbol)
     if sma_5m_50 is None or pd.isna(sma_5m_50):
         sma_5m_50 = sma_3m_50
 
@@ -319,89 +436,79 @@ def send_telegram(message):
         log_msg(f"Telegram error: {e}")
         return False
 
-def get_oanda_candles(granularity="M3", count=60):
+def get_oanda_candles(granularity="M3", count=60, symbol=None):
+    """Fetch candles for an explicit pair; independent of dashboard selection."""
+    symbol = symbol or app_state["symbol"]
+    if symbol not in AVAILABLE_PAIRS:
+        log_msg(f"Rejected unsupported OANDA instrument: {symbol}")
+        return pd.DataFrame()
     if not OANDA_TOKEN:
+        pair_status[symbol]["oanda_health"] = "Missing Credentials"
         app_state["oanda_health"] = "Missing Credentials"
-        log_msg("OANDA token is missing. Set the OANDA_TOKEN variable.")
+        log_msg("OANDA token is missing. Set OANDA_TOKEN.")
         return pd.DataFrame()
 
-    active_symbol = app_state["symbol"]
-    url = f"{OANDA_URL}/v3/instruments/{active_symbol}/candles"
-    headers = {
-        "Authorization": f"Bearer {OANDA_TOKEN}",
-        "Accept-Datetime-Format": "RFC3339",
-    }
+    url = f"{OANDA_URL}/v3/instruments/{symbol}/candles"
+    headers = {"Authorization": f"Bearer {OANDA_TOKEN}",
+               "Accept-Datetime-Format": "RFC3339"}
     params = {"granularity": granularity, "count": count, "price": "M"}
-
     try:
         response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
-
-        payload = response.json()
         candles = []
-        for candle in payload.get("candles", []):
+        for candle in response.json().get("candles", []):
             mid = candle.get("mid")
             if not mid:
                 continue
             candles.append({
                 "Time": pd.to_datetime(candle["time"], utc=True),
-                "Open": float(mid["o"]),
-                "High": float(mid["h"]),
-                "Low": float(mid["l"]),
-                "Close": float(mid["c"]),
-                "Complete": candle.get("complete", False),
+                "Open": float(mid["o"]), "High": float(mid["h"]),
+                "Low": float(mid["l"]), "Close": float(mid["c"]),
+                "Complete": bool(candle.get("complete", False))
             })
-
-        app_state["oanda_health"] = "Healthy 🟢"
         if not candles:
-            log_msg(f"OANDA returned no usable candles (granularity={granularity}, symbol={active_symbol}).")
+            log_msg(f"[{symbol}] OANDA returned no usable {granularity} candles.")
             return pd.DataFrame()
-
+        pair_status[symbol]["oanda_health"] = "Healthy 🟢"
         return pd.DataFrame(candles).set_index("Time").sort_index()
-
-    except requests.HTTPError as e:
-        response = e.response
-        status_code = response.status_code if response is not None else "unknown"
+    except requests.HTTPError as exc:
+        response = exc.response
+        status = response.status_code if response is not None else "unknown"
         body = response.text[:1000] if response is not None else "No response body"
-        app_state["oanda_health"] = f"HTTP Error {status_code} 🔴"
-        log_msg(f"OANDA HTTP error | symbol={active_symbol} | granularity={granularity} | status={status_code} | body={body}")
-        return pd.DataFrame()
+        pair_status[symbol]["oanda_health"] = f"HTTP Error {status} 🔴"
+        log_msg(f"OANDA HTTP error | {symbol} {granularity} | status={status} | body={body}")
+    except requests.Timeout as exc:
+        pair_status[symbol]["oanda_health"] = "Timeout 🔴"
+        log_msg(f"OANDA timeout | {symbol} {granularity} | {exc}")
+    except requests.ConnectionError as exc:
+        pair_status[symbol]["oanda_health"] = "Connection Error 🔴"
+        log_msg(f"OANDA connection error | {symbol} {granularity} | {exc}")
+    except requests.RequestException as exc:
+        pair_status[symbol]["oanda_health"] = "Request Error 🔴"
+        log_msg(f"OANDA request error | {symbol} {granularity} | {exc}")
+    except (ValueError, KeyError, TypeError) as exc:
+        pair_status[symbol]["oanda_health"] = "Data Error 🔴"
+        log_msg(f"OANDA parsing error | {symbol} {granularity} | {type(exc).__name__}: {exc}")
+    return pd.DataFrame()
 
-    except requests.Timeout as e:
-        app_state["oanda_health"] = "Timeout 🔴"
-        log_msg(f"OANDA timeout | symbol={active_symbol} | granularity={granularity} | {e}")
-        return pd.DataFrame()
-
-    except requests.ConnectionError as e:
-        app_state["oanda_health"] = "Connection Error 🔴"
-        log_msg(f"OANDA connection error | symbol={active_symbol} | granularity={granularity} | {e}")
-        return pd.DataFrame()
-
-    except requests.RequestException as e:
-        app_state["oanda_health"] = "Request Error 🔴"
-        log_msg(f"OANDA request error | symbol={active_symbol} | granularity={granularity} | {e}")
-        return pd.DataFrame()
-
-    except (ValueError, KeyError, TypeError) as e:
-        app_state["oanda_health"] = "Data Error 🔴"
-        log_msg(f"OANDA response/data parsing error | granularity={granularity} | {type(e).__name__}: {e}")
-        return pd.DataFrame()
-
-def get_m5_trend_and_sma():
-    df = get_oanda_candles("M5", count=100)
+def get_m5_trend_and_sma(symbol, force_refresh=False):
+    """Cache M5 trend separately for each pair."""
+    cached = m5_cache[symbol]
+    now = time.monotonic()
+    if not force_refresh and now - cached["timestamp"] < M5_CACHE_SECONDS:
+        return cached["trend"], cached["sma50"]
+    df = get_oanda_candles("M5", count=100, symbol=symbol)
     if df.empty:
-        return None, None
+        return cached["trend"], cached["sma50"]
     df = df[df["Complete"]].copy()
     if len(df) < M5_SMA_PERIOD:
         return None, None
-    df["SMA50"] = df["Close"].rolling(M5_SMA_PERIOD).mean()
-    latest = df.iloc[-1]
-    sma50_val = float(latest["SMA50"])
-    if latest["Close"] > sma50_val:
-        return "bullish", sma50_val
-    if latest["Close"] < sma50_val:
-        return "bearish", sma50_val
-    return None, sma50_val
+    sma50 = float(df["Close"].rolling(M5_SMA_PERIOD).mean().iloc[-1])
+    close = float(df["Close"].iloc[-1])
+    trend = "bullish" if close > sma50 else "bearish" if close < sma50 else None
+    cached.update({"timestamp": now, "trend": trend, "sma50": sma50})
+    pair_status[symbol]["m5_trend"] = trend.upper() if trend else "Neutral"
+    return trend, sma50
 
 def detect_sma20_cross(df):
     df = df[df["Complete"]].copy()
@@ -415,242 +522,208 @@ def detect_sma20_cross(df):
         return "below"
     return None
 
-def find_matching_fvg(
-    df,
-    direction,
-    crossing_time,
-    lookback=10,
-    lookahead=10
-):
+def find_matching_fvg(df, direction, crossing_time, lookback=10, lookahead=10):
+    """
+    Find the earliest fresh FVG across pre-cross, at-cross and post-cross candles.
+    All three FVG-forming candles must have the required candle colour.
+    Mitigated candidates are skipped so another qualifying FVG can be considered.
+    """
     df = df[df["Complete"]].copy().sort_index()
-
     if len(df) < 3 or crossing_time not in df.index:
         return None
-
     crossing_pos = df.index.get_loc(crossing_time)
     first_i = max(2, crossing_pos - lookback)
     last_i = min(len(df) - 1, crossing_pos + lookahead)
 
-    before_or_at = []
-    after = []
-
     for i in range(first_i, last_i + 1):
-        first = df.iloc[i - 2]
-        second = df.iloc[i - 1]
-        third = df.iloc[i]
-
+        first, second, third = df.iloc[i - 2], df.iloc[i - 1], df.iloc[i]
         if direction == "bearish":
-            correct_colours = (
-                first["Close"] < first["Open"]
-                and second["Close"] < second["Open"]
-                and third["Close"] < third["Open"]
-            )
+            candles_match = all(c["Close"] < c["Open"] for c in (first, second, third))
             gap_exists = first["Low"] > third["High"]
-
-            if correct_colours and gap_exists:
-                candidate = {
-                    "type": "Bearish FVG",
-                    "time": df.index[i],
-                    "top": float(first["Low"]),
-                    "bottom": float(third["High"])
-                }
-            else:
+            if not (candles_match and gap_exists):
                 continue
-
+            candidate = {"type": "Bearish FVG", "time": df.index[i],
+                         "top": float(first["Low"]), "bottom": float(third["High"])}
         elif direction == "bullish":
-            correct_colours = (
-                first["Close"] > first["Open"]
-                and second["Close"] > second["Open"]
-                and third["Close"] > third["Open"]
-            )
+            candles_match = all(c["Close"] > c["Open"] for c in (first, second, third))
             gap_exists = first["High"] < third["Low"]
-
-            if correct_colours and gap_exists:
-                candidate = {
-                    "type": "Bullish FVG",
-                    "time": df.index[i],
-                    "top": float(third["Low"]),
-                    "bottom": float(first["High"])
-                }
-            else:
+            if not (candles_match and gap_exists):
                 continue
+            candidate = {"type": "Bullish FVG", "time": df.index[i],
+                         "top": float(third["Low"]), "bottom": float(first["High"])}
         else:
             raise ValueError("direction must be 'bullish' or 'bearish'")
 
-        if i <= crossing_pos:
-            before_or_at.append(candidate)
-        else:
-            after.append(candidate)
-
-    if before_or_at:
-        return max(before_or_at, key=lambda fvg: fvg["time"])
-
-    if after:
-        return min(after, key=lambda fvg: fvg["time"])
-
+        if not is_fvg_mitigated(df, candidate):
+            return candidate
     return None
 
 def is_trading_time():
     uk_time = datetime.now(ZoneInfo("Europe/London"))
     return 7 <= uk_time.hour < 20
 
+def process_pair(symbol):
+    """Run one independent scan cycle for EUR_JPY or GBP_JPY."""
+    pair_status[symbol]["scanner_status"] = "Fetching M3 candles..."
+    df_3m = get_oanda_candles("M3", count=80, symbol=symbol)
+    if df_3m.empty:
+        pair_status[symbol]["scanner_status"] = "Waiting for OANDA data"
+        return
+
+    completed = df_3m[df_3m["Complete"]].copy().sort_index()
+    if len(completed) < max(M3_SMA_PERIOD + 1, M5_SMA_PERIOD):
+        pair_status[symbol]["scanner_status"] = "Waiting for enough completed candles"
+        return
+
+    latest_time = completed.index[-1]
+    pair_status[symbol]["last_candle"] = latest_time.isoformat()
+    latest_close = latest_time + pd.Timedelta(minutes=3)
+    candle_age = (pd.Timestamp.now(tz="UTC") - latest_close).total_seconds()
+    if candle_age > 6 * 60:
+        pair_status[symbol]["scanner_status"] = "Latest completed candle is stale"
+        return
+
+    pair_status[symbol]["scanner_status"] = "Checking M3 SMA20 crossing..."
+    crossing = detect_sma20_cross(completed)
+    if crossing is not None and latest_time != last_processed_crossing[symbol]:
+        last_processed_crossing[symbol] = latest_time
+        trend, m5_sma50 = get_m5_trend_and_sma(symbol, force_refresh=True)
+
+        # Counter-trend pullback: bullish M5 + M3 cross below = LONG with bearish FVG.
+        # Bearish M5 + M3 cross above = SHORT with bullish FVG.
+        if trend == "bullish" and crossing == "below":
+            alert_type, label, fvg_direction = "long", "LONG PULLBACK", "bearish"
+        elif trend == "bearish" and crossing == "above":
+            alert_type, label, fvg_direction = "short", "SHORT PULLBACK", "bullish"
+        else:
+            alert_type = None
+
+        if alert_type:
+            pending_crossings[symbol][latest_time.isoformat()] = {
+                "symbol": symbol, "time": latest_time, "created_at": time.time(), "crossing": crossing,
+                "trend": trend, "m5_sma50": m5_sma50,
+                "alert_type": alert_type, "alert_label": label,
+                "fvg_direction": fvg_direction,
+                "price": float(completed.iloc[-1]["Close"])
+            }
+            log_msg(f"[{symbol}] {crossing.upper()} SMA20 cross | M5={trend} | waiting for {fvg_direction} FVG.")
+
+    pair_status[symbol]["scanner_status"] = f"Processing {len(pending_crossings[symbol])} pending setup(s)"
+    for key, setup in list(pending_crossings[symbol].items()):
+        crossing_time = setup["time"]
+        setup_created_at = setup.get("created_at")
+        if setup_created_at is None:
+            # Backward-compatible fallback for any in-memory setup created before this update.
+            setup_created_at = pd.Timestamp(crossing_time).timestamp()
+        if time.time() - float(setup_created_at) >= MAX_SETUP_AGE_SECONDS:
+            pending_crossings[symbol].pop(key, None)
+            log_msg(f"[{symbol}] Pending setup expired after 30 minutes; it will not alert.")
+            continue
+        if crossing_time not in completed.index:
+            pending_crossings[symbol].pop(key, None)
+            continue
+        crossing_pos = completed.index.get_loc(crossing_time)
+        age = (len(completed) - 1) - crossing_pos
+        if age > FVG_LOOKAHEAD:
+            pending_crossings[symbol].pop(key, None)
+            log_msg(f"[{symbol}] Setup expired; no matching FVG within {FVG_LOOKAHEAD} candles.")
+            continue
+
+        fvg = find_matching_fvg(completed, setup["fvg_direction"], crossing_time,
+                                FVG_LOOKBACK, FVG_LOOKAHEAD)
+        if fvg is None:
+            continue
+
+        setup_id = make_setup_id(symbol, setup, fvg)
+        with alert_lock:
+            if setup_id in sending_setups:
+                pending_crossings[symbol].pop(key, None)
+                continue
+            sending_setups.add(setup_id)
+
+        try:
+            claimed = claim_setup(setup_id)
+        except sqlite3.Error as exc:
+            with alert_lock:
+                sending_setups.discard(setup_id)
+            log_msg(f"[{symbol}] Could not claim alert safely (SQLite): {exc}")
+            continue
+
+        if not claimed:
+            with alert_lock:
+                sending_setups.discard(setup_id)
+            pending_crossings[symbol].pop(key, None)
+            continue
+
+        try:
+            # Only completed M3 candles are passed into signal evaluation.
+            alert_close_time = latest_time + pd.Timedelta(minutes=3)
+            probability, raw_score, tier, features = evaluate_pair_ml_setup(
+                symbol, setup, fvg, completed, alert_close_time
+            )
+            wait_mins = features["Wait_After_Cross_Mins"]
+            gap_size = features["FVG GAP"]
+            regime = "Post-Cross FVG" if fvg["time"] > crossing_time else "Pre/At-Cross FVG"
+            fvg_uk = fvg["time"].tz_convert("Europe/London")
+            now_uk = pd.Timestamp.now(tz="Europe/London")
+            delay_seconds = max(0.0, (now_uk - fvg_uk).total_seconds())
+
+            message = (
+                f"🚨 {symbol} - {setup['alert_label']}\\n\\n"
+                f"• ML 60m Revisit Est: {probability:.1%}\\n"
+                f"• Signal Tier: {tier}\\n"
+                f"• Setup Regime: {regime}\\n"
+                f"• Wait After Cross: {wait_mins:.0f} mins\\n"
+                f"• Trend (M5 SMA50): {setup['trend'].upper()}\\n"
+                f"• M3 crossing: {setup['crossing'].upper()} SMA20\\n"
+                f"• FVG: {fvg['type']} ({fvg['bottom']:.3f} - {fvg['top']:.3f})\\n"
+                f"• FVG Gap: {gap_size:.3f}\\n"
+                f"• Time since FVG candle: {delay_seconds:.0f}s"
+            )
+
+            if send_telegram(message):
+                update_setup_status(setup_id, "sent")
+                pending_crossings[symbol].pop(key, None)
+                pair_status[symbol]["last_alert"] = datetime.now(
+                    ZoneInfo("Europe/London")).strftime("%Y-%m-%d %H:%M:%S UK")
+                log_msg(f"[{symbol}] Telegram alert sent once | {fvg['type']} | score={raw_score:.3f}")
+            else:
+                update_setup_status(setup_id, "failed")
+                log_msg(f"[{symbol}] Telegram send failed; setup remains pending for retry.")
+        finally:
+            with alert_lock:
+                sending_setups.discard(setup_id)
+
+    pair_status[symbol]["scanner_status"] = "Idle — monitoring"
+
+
 def run_fvg_scanner():
+    initialise_alert_db()
     load_ml_models()
-    last_processed_crossing = None
+    log_msg("Scanner started: EUR_JPY and GBP_JPY are both enabled.")
+    last_db_cleanup = 0.0
 
     while True:
-        try:
-            active_symbol = app_state["symbol"]
-            update_ml_status_badge()
+        cycle_start = time.monotonic()
+        if cycle_start - last_db_cleanup >= DB_CLEANUP_INTERVAL_SECONDS:
+            try:
+                cleanup_expired_setup_records()
+            except sqlite3.Error as exc:
+                log_msg(f"SQLite cleanup error: {exc}")
+            last_db_cleanup = cycle_start
+        if not is_trading_time():
+            for pair in AVAILABLE_PAIRS:
+                pair_status[pair]["scanner_status"] = "Paused (outside UK 07:00–20:00)"
+        else:
+            for pair in AVAILABLE_PAIRS:
+                try:
+                    process_pair(pair)
+                except Exception as exc:
+                    pair_status[pair]["scanner_status"] = "Scanner error"
+                    log_msg(f"[{pair}] Scanner error: {type(exc).__name__}: {exc}")
 
-            if not is_trading_time():
-                app_state["scanner_status"] = "Paused (Outside UK Trading Hours)"
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            app_state["scanner_status"] = f"Fetching M3 Candles for {active_symbol}..."
-            df_3m = get_oanda_candles("M3", count=60)
-            if df_3m.empty:
-                app_state["scanner_status"] = "Waiting for OANDA Data..."
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            completed_3m = df_3m[df_3m["Complete"]].copy().sort_index()
-            if len(completed_3m) < M5_SMA_PERIOD:
-                app_state["scanner_status"] = "Waiting for sufficient completed M3 candles..."
-                time.sleep(SCAN_INTERVAL)
-                continue
-
-            candle_time = completed_3m.index[-1]
-
-            app_state["scanner_status"] = "Checking SMA20 Crossings..."
-            crossing = detect_sma20_cross(completed_3m)
-
-            if crossing is not None and (active_symbol, candle_time) != last_processed_crossing:
-                last_processed_crossing = (active_symbol, candle_time)
-
-                app_state["scanner_status"] = "Checking M5 Trend for new crossing..."
-                trend, m5_sma50_val = get_m5_trend_and_sma()
-                app_state["m5_trend"] = trend.upper() if trend else "Neutral"
-
-                if trend == "bullish" and crossing == "below":
-                    alert_type, alert_label, fvg_direction = "long", "LONG PULLBACK", "bearish"
-                elif trend == "bearish" and crossing == "above":
-                    alert_type, alert_label, fvg_direction = "short", "SHORT PULLBACK", "bullish"
-                else:
-                    alert_type = None
-
-                if alert_type:
-                    pending_crossings[str(candle_time)] = {
-                        "symbol": active_symbol,
-                        "time": candle_time,
-                        "crossing": crossing,
-                        "trend": trend,
-                        "m5_sma50": m5_sma50_val,
-                        "alert_type": alert_type,
-                        "alert_label": alert_label,
-                        "fvg_direction": fvg_direction,
-                        "price": float(completed_3m.iloc[-1]["Close"])
-                    }
-                    log_msg(f"[{active_symbol}] New Crossing: {crossing.upper()} | Trend: {trend} | Need {fvg_direction} FVG.")
-
-            # Process Pending Crossings
-            app_state["scanner_status"] = f"Processing {len(pending_crossings)} pending setups..."
-            for key in list(pending_crossings.keys()):
-                setup = pending_crossings[key]
-                if setup.get("symbol") != active_symbol:
-                    pending_crossings.pop(key, None)
-                    continue
-
-                crossing_time = setup["time"]
-                if crossing_time not in completed_3m.index:
-                    pending_crossings.pop(key, None)
-                    continue
-
-                age = (len(completed_3m) - 1) - completed_3m.index.get_loc(crossing_time)
-                if age > FVG_LOOKAHEAD:
-                    pending_crossings.pop(key, None)
-                    continue
-
-                fvg = find_matching_fvg(
-                    completed_3m,
-                    direction=setup["fvg_direction"],
-                    crossing_time=crossing_time,
-                    lookback=FVG_LOOKBACK,
-                    lookahead=FVG_LOOKAHEAD
-                )
-
-                if fvg is None:
-                    continue
-
-                # ==========================================
-                # CHECK IF FVG IS ALREADY VISITED BEFORE ALERT
-                # ==========================================
-                post_fvg_candles = completed_3m.loc[completed_3m.index > fvg["time"]]
-                is_mitigated = False
-
-                if not post_fvg_candles.empty:
-                    if fvg["type"] == "Bearish FVG":
-                        if (post_fvg_candles["High"] >= fvg["bottom"]).any():
-                            is_mitigated = True
-                    elif fvg["type"] == "Bullish FVG":
-                        if (post_fvg_candles["Low"] <= fvg["top"]).any():
-                            is_mitigated = True
-
-                if is_mitigated:
-                    log_msg(f"[{active_symbol}] Discarding setup: {fvg['type']} at {fvg['time'].strftime('%H:%M')} already visited.")
-                    pending_crossings.pop(key, None)
-                    continue
-                # ==========================================
-
-                setup_key = (active_symbol, setup["alert_type"], str(crossing_time), str(fvg["time"]))
-                if setup_key in alerted_setups:
-                    pending_crossings.pop(key, None)
-                    continue
-
-                alert_close_time = candle_time + timedelta(minutes=3)
-                est_revisit_prob, ml_raw_score, confidence_tier, feat_info = evaluate_pair_ml_setup(
-                    active_symbol, setup, fvg, completed_3m, alert_close_time
-                )
-
-                wait_mins = feat_info["Wait_After_Cross_Mins"]
-                gap_size = feat_info["FVG GAP"]
-                regime_label = "Post-Cross FVG" if wait_mins > 3.0 else "Pre-Cross FVG"
-
-                log_msg(
-                    f"[{active_symbol}] FVG confirmed at {fvg['time']} UTC | Crossing at {crossing_time} UTC | "
-                    f"ML Prob: {est_revisit_prob:.1%} ({confidence_tier})"
-                )
-
-                fvg_uk = fvg["time"].tz_convert("Europe/London")
-                detected_uk = pd.Timestamp.now(tz="Europe/London")
-                delay_seconds = (detected_uk - fvg_uk).total_seconds()
-
-                message = (
-                    f"🚨 {active_symbol} - {setup['alert_label']}\n\n"
-                    f"• ML 60m Revisit Est: {est_revisit_prob:.1%}\n"
-                    f"• Signal Tier: {confidence_tier}\n"
-                    f"• Setup Regime: {regime_label}\n"
-                    f"• Wait After Cross: {wait_mins:.0f} mins\n"
-                    f"• Trend: {setup['trend'].upper()}\n"
-                    f"• M3 crossing: {setup['crossing'].upper()} SMA20\n"
-                    f"• FVG: {fvg['type']} ({fvg['bottom']:.3f} - {fvg['top']:.3f})\n"
-                    f"• FVG Gap: {gap_size:.3f}\n"
-                    f"• Time since close: {delay_seconds:.0f}s"
-                )
-
-                if send_telegram(message):
-                    alerted_setups.add(setup_key)
-                    pending_crossings.pop(key, None)
-                    log_msg(f"[{active_symbol}] Telegram alert sent successfully.")
-
-            app_state["scanner_status"] = "Idle (Waiting for next scan interval)"
-
-        except Exception as e:
-            app_state["scanner_status"] = "Error in Scanner Loop"
-            log_msg(f"Scanner error: {e}")
-
-        time.sleep(SCAN_INTERVAL)
+        elapsed = time.monotonic() - cycle_start
+        time.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -802,11 +875,12 @@ HTML_TEMPLATE = """
 <body>
     <div class="header">
         <h1>Trading Alert Dashboard</h1>
+        <p style="color:#94a3b8;margin:6px 0 0;">EUR/JPY and GBP/JPY are scanned independently.</p>
     </div>
     
     <div class="container">
         <div class="panel panel-controls">
-            <h2>System Control</h2>
+            <h2>Dashboard View (Both Pairs Scan)</h2>
             <div class="control-group">
                 <select id="symbol-select">
                     {% for pair in pairs %}
@@ -816,7 +890,10 @@ HTML_TEMPLATE = """
                 <button onclick="updateSymbol()">Apply</button>
             </div>
             
-            <h2>Live API & ML Health</h2>
+            <h2>Both Pair Scanners</h2>
+            <div id="pair-status-container" style="margin-bottom: 24px; color: #94a3b8;">Loading pair status...</div>
+
+            <h2>Selected Pair API & ML Health</h2>
             <div class="status-row">
                 <span class="status-label">OANDA API:</span>
                 <span class="status-val" id="oanda-health">...</span>
@@ -902,6 +979,21 @@ HTML_TEMPLATE = """
             }).join('');
         }
 
+        function renderPairStatuses(pairData) {
+            const container = document.getElementById('pair-status-container');
+            container.innerHTML = Object.entries(pairData || {}).map(([pair, info]) => `
+                <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:10px;margin-bottom:8px;">
+                    <div style="display:flex;justify-content:space-between;gap:8px;">
+                        <strong style="color:#f8fafc;">${pair}</strong>
+                        <span style="color:${info.oanda_health.includes('Healthy') ? '#34d399' : '#fbbf24'};">${info.oanda_health}</span>
+                    </div>
+                    <div style="font-size:.85rem;margin-top:5px;">${info.scanner_status}</div>
+                    <div style="font-size:.8rem;margin-top:3px;">M5 trend: ${info.m5_trend} · ML: ${info.ml_status}</div>
+                    <div style="font-size:.8rem;margin-top:3px;">Last alert: ${info.last_alert || 'None yet'}</div>
+                </div>
+            `).join('');
+        }
+
         function fetchData() {
             fetch('/api/data')
                 .then(res => res.json())
@@ -940,26 +1032,29 @@ def index():
 
 @app.route('/api/data')
 def api_data():
-    app_state["todays_news"] = get_todays_pair_news(app_state["symbol"], buffer_minutes=5)
-    return jsonify({
-        "state": app_state,
-        "logs": list(system_logs)
-    })
+    selected = app_state["symbol"]
+    selected_status = pair_status[selected]
+    app_state["oanda_health"] = selected_status["oanda_health"]
+    app_state["scanner_status"] = selected_status["scanner_status"]
+    app_state["m5_trend"] = selected_status["m5_trend"]
+    app_state["ml_status"] = selected_status["ml_status"]
+    app_state["todays_news"] = get_todays_pair_news(selected, buffer_minutes=5)
+    return jsonify({"state": app_state, "pairs": pair_status, "logs": list(system_logs)})
+
 
 @app.route('/api/settings', methods=['POST'])
 def api_settings():
-    data = request.json
+    data = request.get_json(silent=True) or {}
     new_symbol = data.get("symbol")
-    if new_symbol and new_symbol in AVAILABLE_PAIRS:
+    if new_symbol in AVAILABLE_PAIRS:
+        # Dashboard selector changes the displayed pair only, not scanner coverage.
         app_state["symbol"] = new_symbol
-        pending_crossings.clear()
-        alerted_setups.clear()
-        update_ml_status_badge()
-        log_msg(f"=== SYSTEM SWITCHED PAIR TO {new_symbol} ===")
+        log_msg(f"Dashboard view changed to {new_symbol}; both pairs remain active.")
         return jsonify({"status": "success", "symbol": new_symbol})
-    return jsonify({"status": "error", "message": "Invalid symbol. Only EUR_JPY and GBP_JPY are enabled."}), 400
+    return jsonify({"status": "error",
+                    "message": "Invalid symbol. Only EUR_JPY and GBP_JPY are enabled."}), 400
 
 if __name__ == '__main__':
-    scanner_thread = threading.Thread(target=run_fvg_scanner, daemon=True)
+    scanner_thread = threading.Thread(target=run_fvg_scanner, name="fvg-scanner", daemon=True)
     scanner_thread.start()
     app.run(host='0.0.0.0', port=8001, debug=False, use_reloader=False)
