@@ -672,16 +672,16 @@ def process_pair(symbol):
             delay_seconds = max(0.0, (now_uk - fvg_uk).total_seconds())
 
             message = (
-                f"🚨 {symbol} - {setup['alert_label']}\\n\\n"
-                f"• ML 60m Revisit Est: {probability:.1%}\\n"
+                f"{symbol} - {setup['alert_label']}\n"
+                f"• ML 60m Revisit Est: {probability:.1%}\n"
                 f"• Signal Tier: {tier}\\n"
-                f"• Setup Regime: {regime}\\n"
-                f"• Wait After Cross: {wait_mins:.0f} mins\\n"
-                f"• Trend (M5 SMA50): {setup['trend'].upper()}\\n"
-                f"• M3 crossing: {setup['crossing'].upper()} SMA20\\n"
-                f"• FVG: {fvg['type']} ({fvg['bottom']:.3f} - {fvg['top']:.3f})\\n"
-                f"• FVG Gap: {gap_size:.3f}\\n"
-                f"• Time since FVG candle: {delay_seconds:.0f}s"
+                # f"• Setup Regime: {regime}\\n"
+                # f"• Wait After Cross: {wait_mins:.0f} mins\\n"
+                f"• Trend (M5 SMA50): {setup['trend'].upper()}\n"
+                # f"• M3 crossing: {setup['crossing'].upper()} SMA20\n"
+                f"• FVG: {fvg['type']} ({fvg['bottom']:.3f} - {fvg['top']:.3f})\n"
+                # f"• FVG Gap: {gap_size:.3f}\n"
+                # f"• Time since FVG candle: {delay_seconds:.0f}s"
             )
 
             if send_telegram(message):
