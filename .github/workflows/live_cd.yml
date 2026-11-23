@@ -44,7 +44,7 @@ jobs:
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.GCP_SSH_USER }}@${{ secrets.GCP_VM_IP }} << 'EOF'
             cd ~/fx_scanner
-            ./venv/bin/pip install requests pandas numpy flask joblib scikit-learn xgboost --quiet
+            ./venv/bin/pip install requests pandas numpy flask joblib scikit-learn xgboost lightgbm --quiet
             sudo systemctl restart fx_scanner
             sleep 2
             sudo systemctl is-active --quiet fx_scanner && echo "✅ Live App Updated & Running!" || (cat scanner.log && exit 1)

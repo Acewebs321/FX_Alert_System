@@ -221,9 +221,9 @@ def is_fvg_mitigated(df, fvg):
 
 def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
     """
-    Computes the 16 features for the active pair (EUR_JPY or GBP_JPY) using
-    pair-specific gap quantiles and returns:
-    (est_revisit_prob, raw_score, confidence_tier_label, feature_summary_dict)
+    Computes all 27 features for the updated calibrated ensemble (XGB + LGBM + RF + ET)
+    AND retains legacy 16-feature keys for backward compatibility with older .joblib bundles.
+    Returns: (est_revisit_prob, raw_score, confidence_tier_label, feature_summary_dict)
     """
     crossing_time = setup["time"]
     fvg_time = fvg["time"]
@@ -237,7 +237,29 @@ def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
     df_calc = completed_3m.copy()
     df_calc["SMA20"] = df_calc["Close"].rolling(M3_SMA_PERIOD).mean()
     df_calc["SMA50"] = df_calc["Close"].rolling(M5_SMA_PERIOD).mean()
+
+    # 14-period True Range & ATR on M3 (matches training pipeline)
+    prev_close = df_calc["Close"].shift(1)
+    tr = pd.concat([
+        df_calc["High"] - df_calc["Low"],
+        (df_calc["High"] - prev_close).abs(),
+        (df_calc["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    df_calc["ATR14"] = tr.rolling(14).mean().bfill().replace(0, 1e-5)
+
+    # 14-period RSI on M3 (matches training pipeline)
+    delta = df_calc["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df_calc["RSI14"] = (100.0 - (100.0 / (1.0 + gain / (loss + 1e-8)))).fillna(50.0)
+
     current = df_calc.iloc[-1]
+    c_open = float(current["Open"])
+    c_high = float(current["High"])
+    c_low = float(current["Low"])
+    c_close = float(current["Close"])
+    cur_atr = float(current["ATR14"]) if pd.notna(current["ATR14"]) and current["ATR14"] > 0 else 1e-5
+    cur_rsi = float(current["RSI14"]) if pd.notna(current["RSI14"]) else 50.0
 
     sma_3m_20 = float(current["SMA20"])
     sma_3m_50 = float(current["SMA50"]) if pd.notna(current["SMA50"]) else sma_3m_20
@@ -247,87 +269,164 @@ def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
         _, sma_5m_50 = get_m5_trend_and_sma(symbol)
     if sma_5m_50 is None or pd.isna(sma_5m_50):
         sma_5m_50 = sma_3m_50
+    sma_5m_50 = float(sma_5m_50)
 
     trend_bullish = 1 if setup["trend"] == "bullish" else 0
     sign = 1.0 if trend_bullish == 1 else -1.0
 
+    # Timing features
     fvg_to_cross_mins = (crossing_time - fvg_time).total_seconds() / 60.0
     wait_after_cross_mins = (alert_close_time - crossing_time).total_seconds() / 60.0
-    gap_size = abs(float(fvg["top"]) - float(fvg["bottom"]))
+    total_setup_mins = (alert_close_time - fvg_time).total_seconds() / 60.0
+    wait_to_total_ratio = wait_after_cross_mins / (abs(total_setup_mins) + 1.0)
 
-    is_precross_fvg = int(wait_after_cross_mins <= 3.0)
-    is_sweetspot_wait = int(round(wait_after_cross_mins, 1) in [6.0, 9.0, 15.0, 18.0, 21.0, 24.0])
-    is_peak_wait_9_or_18 = int(round(wait_after_cross_mins, 1) in [9.0, 18.0])
-    is_late_wait_27_30 = int(round(wait_after_cross_mins, 1) in [27.0, 30.0])
+    wait_rounded = round(wait_after_cross_mins, 1)
+    is_precross_fvg = int(wait_rounded <= 3.0)
+    is_sweetspot_wait = int(wait_rounded in [6.0, 9.0, 15.0, 18.0, 21.0, 24.0])
+    is_peak_wait_9_or_18 = int(wait_rounded in [9.0, 18.0])
+    is_late_wait_27_30 = int(wait_rounded in [27.0, 30.0])
 
+    # Gap features
+    fvg_top = float(fvg["top"])
+    fvg_bottom = float(fvg["bottom"])
+    gap_size = abs(fvg_top - fvg_bottom)
     is_optimal_gap = int((gap_size > q25_gap) and (gap_size <= q50_gap))
     is_exhaustion_gap = int(gap_size > q75_gap)
+    gap_relative_to_median = gap_size / (q50_gap + 1e-8)
 
-    hour = alert_close_time.hour
+    # Cyclical & Session features (UTC)
+    alert_utc = pd.Timestamp(alert_close_time)
+    if alert_utc.tzinfo is not None:
+        alert_utc = alert_utc.tz_convert("UTC")
+    hour = int(alert_utc.hour)
+    hour_float = hour + alert_utc.minute / 60.0
+    hour_sin = float(np.sin(2.0 * np.pi * hour_float / 24.0))
+    hour_cos = float(np.cos(2.0 * np.pi * hour_float / 24.0))
+    is_london_open = int(7 <= hour < 10)
     is_ny_overlap = int(13 <= hour <= 16)
     is_late_session = int(hour >= 17)
 
+    # Scale-invariant SMA spreads (basis points) + legacy raw diffs
+    price_ref = abs(sma_3m_20) + 1e-8
     sma_3m_20_50_diff = (sma_3m_20 - sma_3m_50) * sign
-    sma_3m20_5m50_diff = (sma_3m_20 - float(sma_5m_50)) * sign
-    sma_3m50_5m50_diff = (sma_3m_50 - float(sma_5m_50)) * sign
-    gap_to_3m_spread_ratio = gap_size / (abs(sma_3m_20_50_diff) + 1e-4)
+    sma_3m20_5m50_diff = (sma_3m_20 - sma_5m_50) * sign
+    sma_3m50_5m50_diff = (sma_3m_50 - sma_5m_50) * sign
+
+    sma_3m_20_50_pct = sma_3m_20_50_diff / price_ref * 10000.0
+    sma_3m20_5m50_pct = sma_3m20_5m50_diff / price_ref * 10000.0
+    sma_3m50_5m50_pct = sma_3m50_5m50_diff / price_ref * 10000.0
+
+    gap_to_3m_spread_ratio = gap_size / (abs(sma_3m_20 - sma_3m_50) + 1e-6)
+    gap_to_5m_spread_ratio = gap_size / (abs(sma_3m_20 - sma_5m_50) + 1e-6)
+
+    # ATR & Price-Action Geometry features
+    if fvg["type"] == "Bearish FVG":
+        dist_to_fvg = fvg_bottom - c_close
+        rejection_wick = c_high - max(c_open, c_close)
+        rsi_exhaustion = 100.0 - cur_rsi
+    else:
+        dist_to_fvg = c_close - fvg_top
+        rejection_wick = min(c_open, c_close) - c_low
+        rsi_exhaustion = cur_rsi
+
+    dist_in_atr = dist_to_fvg / cur_atr
+    gap_in_atr = gap_size / cur_atr
+    wick_in_atr = rejection_wick / cur_atr
+    sma20_prev3 = float(df_calc["SMA20"].iloc[-4]) if len(df_calc) >= 4 and pd.notna(df_calc["SMA20"].iloc[-4]) else sma_3m_20
+    sma20_slope_atr = (sma_3m_20 - sma20_prev3) / cur_atr
 
     row_dict = {
+        # --- Updated 27-Feature Model Inputs ---
         "Wait_After_Cross_Mins": wait_after_cross_mins,
         "FVG_to_Cross_Mins": fvg_to_cross_mins,
+        "Total_Setup_Mins": total_setup_mins,
+        "Wait_to_Total_Ratio": wait_to_total_ratio,
         "Is_PreCross_FVG": is_precross_fvg,
         "Is_SweetSpot_Wait": is_sweetspot_wait,
         "Is_Peak_Wait_9_or_18": is_peak_wait_9_or_18,
         "Is_Late_Wait_27_30": is_late_wait_27_30,
-        "FVG GAP": gap_size,
+        "Gap_Relative_to_Median": gap_relative_to_median,
         "Is_Optimal_Gap": is_optimal_gap,
         "Is_Exhaustion_Gap": is_exhaustion_gap,
+        "Hour_Sin": hour_sin,
+        "Hour_Cos": hour_cos,
+        "Is_London_Open": is_london_open,
         "Is_NY_Overlap": is_ny_overlap,
         "Is_Late_Session": is_late_session,
+        "SMA_3m_20_50_Pct": sma_3m_20_50_pct,
+        "SMA_3m20_5m50_Pct": sma_3m20_5m50_pct,
+        "SMA_3m50_5m50_Pct": sma_3m50_5m50_pct,
+        "Gap_to_3mSpread_Ratio": gap_to_3m_spread_ratio,
+        "Gap_to_5mSpread_Ratio": gap_to_5m_spread_ratio,
+        "Trend_Bullish": trend_bullish,
+        "Dist_in_ATR": dist_in_atr,
+        "Gap_in_ATR": gap_in_atr,
+        "Wick_in_ATR": wick_in_atr,
+        "SMA20_Slope_ATR": sma20_slope_atr,
+        "RSI_Exhaustion": rsi_exhaustion,
+        # --- Legacy 16-Feature Keys (Backward Compatibility) ---
+        "FVG GAP": gap_size,
         "SMA_3m_20_50_Diff": sma_3m_20_50_diff,
         "SMA_3m20_5m50_Diff": sma_3m20_5m50_diff,
         "SMA_3m50_5m50_Diff": sma_3m50_5m50_diff,
-        "Gap_to_3mSpread_Ratio": gap_to_3m_spread_ratio,
-        "Trend_Bullish": trend_bullish
     }
 
     if bundle is not None:
         try:
             feature_cols = bundle["features"]
             X_live = pd.DataFrame([row_dict])[feature_cols]
-            xgb_prob = float(bundle["xgb"].predict_proba(X_live)[0, 1])
-            rf_prob = float(bundle["rf"].predict_proba(X_live)[0, 1])
-            raw_score = 0.55 * xgb_prob + 0.45 * rf_prob
+
+            p_xgb = float(bundle["xgb"].predict_proba(X_live)[0, 1])
+            p_rf = float(bundle["rf"].predict_proba(X_live)[0, 1])
+            et_model = bundle.get("et")
+            lgbm_model = bundle.get("lgbm")
+
+            if et_model is not None and lgbm_model is not None:
+                p_et = float(et_model.predict_proba(X_live)[0, 1])
+                p_lgbm = float(lgbm_model.predict_proba(X_live)[0, 1])
+                raw_score = 0.40 * p_xgb + 0.30 * p_lgbm + 0.15 * p_rf + 0.15 * p_et
+            elif et_model is not None:
+                p_et = float(et_model.predict_proba(X_live)[0, 1])
+                raw_score = 0.50 * p_xgb + 0.30 * p_rf + 0.20 * p_et
+            else:
+                raw_score = 0.55 * p_xgb + 0.45 * p_rf
 
             p30 = bundle.get("p30_cutoff", 0.45)
             p50 = bundle.get("p50_cutoff", 0.50)
             p70 = bundle.get("p70_cutoff", 0.55)
+            p85 = bundle.get("p85_cutoff")
             tier_wrs = bundle.get("tier_winrates", {})
 
-            if raw_score >= p70:
+            if p85 is not None and raw_score >= p85:
+                tier = "🚀 ULTRA CONVICTION (Top 15%)"
+                tier_wr = tier_wrs.get("top15", tier_wrs.get("top30", 0.870))
+            elif raw_score >= p70:
                 tier = "🔥 HIGH CONVICTION (Top 30%)"
-                est_wr = tier_wrs.get("top30", 0.848)
+                tier_wr = tier_wrs.get("top30", 0.848)
             elif raw_score >= p50:
                 tier = "✅ STRONG SETUP (Top 50%)"
-                est_wr = tier_wrs.get("top50", 0.817)
+                tier_wr = tier_wrs.get("top50", 0.817)
             elif raw_score >= p30:
                 tier = "🟡 MODERATE SETUP (Top 70%)"
-                est_wr = tier_wrs.get("top70", 0.801)
+                tier_wr = tier_wrs.get("top70", 0.801)
             else:
                 tier = "⚠️ LOW PROBABILITY (Bottom 30%)"
-                est_wr = tier_wrs.get("bottom30", 0.705)
+                tier_wr = tier_wrs.get("bottom30", 0.705)
+
+            calibrator = bundle.get("calibrator")
+            est_wr = float(calibrator.predict([raw_score])[0]) if calibrator is not None else float(tier_wr)
 
             return float(est_wr), raw_score, tier, row_dict
         except Exception as e:
             log_msg(f"ML prediction error for {symbol}, using empirical lookup: {e}")
 
     # Empirical fallback calibrated to JPY cross timing regimes
-    wait_Empirical_Map = {
+    wait_empirical_map = {
         3.0: 0.705, 6.0: 0.805, 9.0: 0.861, 12.0: 0.750,
         15.0: 0.832, 18.0: 0.860, 21.0: 0.804, 24.0: 0.826,
         27.0: 0.756, 30.0: 0.726, 33.0: 0.800
     }
-    base_prob = wait_Empirical_Map.get(round(wait_after_cross_mins, 1), 0.783)
+    base_prob = wait_empirical_map.get(wait_rounded, 0.783)
     if is_exhaustion_gap:
         base_prob -= 0.028
     elif is_optimal_gap:
@@ -346,7 +445,6 @@ def evaluate_pair_ml_setup(symbol, setup, fvg, completed_3m, alert_close_time):
         tier = "⚠️ LOWER PROBABILITY (Pre-Cross / Exhaustion)"
 
     return base_prob, base_prob, tier, row_dict
-
 
 # ==============================
 # ECONOMIC CALENDAR
