@@ -2185,7 +2185,7 @@ HTML_TEMPLATE = """
                         data.state.ml_status,
                         mlHealthy
                     );
-
+                    renderPairStatuses(data.pairs);
 
                     // Calendar
 
